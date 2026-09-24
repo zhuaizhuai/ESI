@@ -69,6 +69,51 @@ def test_real_git_and_validation_with_scripted_model(project,monkeypatch):
     assert 'subtract' not in (repo/'calculator.py').read_text()
     assert client.post(f'/api/tasks/{tid}/complete').status_code==200
 
+
+def test_two_repositories_are_researched_and_changed_after_approval(project,tmp_path,monkeypatch):
+    first,repo=project
+    second_repo=tmp_path/'service-b';second_repo.mkdir()
+    (second_repo/'service.py').write_text('def value():\n    return 1\n')
+    subprocess.run(['git','init',str(second_repo)],check=True,capture_output=True)
+    subprocess.run(['git','-C',str(second_repo),'add','.'],check=True)
+    subprocess.run(['git','-C',str(second_repo),'-c','user.name=Test',
+                    '-c','user.email=test@localhost','commit','-m','init'],check=True,capture_output=True)
+    response=client.post('/api/projects',json={'name':'service-b','path':str(second_repo),
+       'checks':['python3 -c "from service import value; assert value()==2"']})
+    assert response.status_code==200,response.text
+    second=response.json()['id']
+    created=client.post('/api/tasks',json={'project_id':first,'project_ids':[first,second],
+       'title':'跨系统变更','requirement':'更新两个服务','acceptance':'两个仓库验证通过'})
+    assert created.status_code==200,created.text
+    tid=created.json()['id']
+    replies=iter([
+        {'tool':'read_file','args':{'project_id':first,'path':'calculator.py'}},
+        {'tool':'read_file','args':{'project_id':second,'path':'service.py'}},
+        {'done':True,'summary':'两个仓库都需要修改，并分别执行验证。'},
+    ])
+    monkeypatch.setattr(worker,'model',lambda messages:next(replies))
+    core.update(tid,status='analyzing')
+    worker.run(core.query('SELECT * FROM tasks WHERE id=?',(tid,),True))
+    detail=client.get(f'/api/tasks/{tid}').json()
+    assert detail['status']=='awaiting_approval'
+    assert len(detail['project_runs'])==2
+    assert client.post(f'/api/tasks/{tid}/approve',json={'version':detail['version']}).status_code==200
+    replies=iter([
+        {'tool':'write_file','args':{'project_id':first,'path':'calculator.py',
+           'content':'def add(a,b):\n    return a+b\n\ndef subtract(a,b):\n    return a-b\n'}},
+        {'tool':'write_file','args':{'project_id':second,'path':'service.py',
+           'content':'def value():\n    return 2\n'}},
+        {'done':True,'summary':'两个仓库修改完成'},
+    ])
+    monkeypatch.setattr(worker,'model',lambda messages:next(replies))
+    worker.run(core.query('SELECT * FROM tasks WHERE id=?',(tid,),True))
+    detail=client.get(f'/api/tasks/{tid}').json()
+    assert detail['status']=='review'
+    assert len(detail['result']['checks'])==2
+    assert {check['project_id'] for check in detail['result']['checks']}=={first,second}
+    assert 'service-b' in detail['result']['diff']
+    assert 'return 1' in (second_repo/'service.py').read_text()
+
 def test_failed_checks_cannot_complete(project,monkeypatch):
     pid,repo=project;tid=create(pid)
     core.execute('UPDATE projects SET checks=? WHERE id=?',(json.dumps(['python3 -c "raise SystemExit(1)"']),pid))

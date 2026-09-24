@@ -31,7 +31,12 @@ def event(tid, message, kind='info', actor_id=None):
     execute('INSERT INTO events(task_id,kind,message,created,actor_id) VALUES(?,?,?,?,?)', (tid,kind,str(message)[:16000],time.time(),actor_id))
 
 def update(tid, **values):
-    execute('UPDATE tasks SET '+','.join(k+'=?' for k in values)+" WHERE id=? AND status NOT IN ('cancelled','interrupted')", (*values.values(),tid))
+    with connection() as c:
+        changed=c.execute('UPDATE tasks SET '+','.join(k+'=?' for k in values)+
+            " WHERE id=? AND status NOT IN ('cancelled','interrupted')", (*values.values(),tid))
+        if changed.rowcount and 'status' in values:
+            from .platform import sync_workflow
+            sync_workflow(c,'development',tid,values['status'])
 
 def git(path, *args):
     return subprocess.check_output(['git','-C',str(path),*args],stderr=subprocess.STDOUT,text=True,timeout=30).strip()

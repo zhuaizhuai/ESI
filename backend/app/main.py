@@ -23,9 +23,12 @@ from .execution import status as execution_status
 from .auth import (COOKIE, PUBLIC_USER, current_user, get_session, public_user,
                    password_hash, verify_password, start_session, require_project,
                    require_data_source, admin, audit, require_admin)
-from .analytics import AGGREGATIONS, schema as data_schema, validate_metric
+from .analytics import AGGREGATIONS, schema as data_schema, validate_metric, validate_spec
+from .platform import (router as platform_router, job_source_ids, require_analysis_sources,
+                       task_project_ids, require_task_projects, sync_workflow)
 
 app = FastAPI(title='ESI · 企业超级智能平台', docs_url=None, redoc_url=None, openapi_url=None)
+app.include_router(platform_router)
 ORIGINS = [x.strip().rstrip('/') for x in os.environ.get(
     'ESI_PUBLIC_ORIGIN','http://localhost:5173,http://127.0.0.1:5173').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_credentials=True,
@@ -78,6 +81,7 @@ class Project(BaseModel):
 
 class Task(BaseModel):
     project_id: str
+    project_ids: list[str] = Field(default_factory=list, max_length=6)
     title: str = Field(min_length=1,max_length=200)
     requirement: str = Field(min_length=1,max_length=20000)
     acceptance: str = Field(min_length=1,max_length=10000)
@@ -91,9 +95,10 @@ class Approval(BaseModel):
 
 class DataSourceInput(BaseModel):
     name: str = Field(min_length=1,max_length=100)
-    kind: Literal['sqlite','csv']
+    kind: Literal['sqlite','csv','http_json']
     path: str
     description: str = Field(default='',max_length=500)
+    auth_env: str = Field(default='',max_length=100)
 
 class DataMember(BaseModel):
     user_id: str
@@ -110,12 +115,14 @@ class MetricInput(BaseModel):
 
 class AnalysisInput(BaseModel):
     source_id: str
+    source_ids: list[str] = Field(default_factory=list, max_length=6)
     title: str = Field(min_length=1,max_length=200)
     question: str = Field(min_length=1,max_length=20000)
     report_kind: Literal['report','strategy'] = 'report'
 
 class AnalysisPlan(BaseModel):
     plan: str = Field(min_length=1,max_length=30000)
+    query_spec: Optional[dict] = None
     version: int
 
 # Dummy work keeps invalid usernames from skipping the password hash cost.
@@ -278,7 +285,9 @@ def data_sources(user=Depends(current_user)):
             for metric in item['metrics']:
                 metric['dimensions']=json.loads(metric['dimensions'])
             # Server file paths are restricted to owners.
-            if item['my_role']!='owner': item['path']='由数据负责人管理'
+            if item['my_role']!='owner':
+                item['path']='由数据负责人管理'
+                item['auth_env']=''
             result.append(item)
     return result
 
@@ -287,13 +296,16 @@ def create_data_source(data: DataSourceInput, user=Depends(current_user)):
     admin(user)
     sid=uuid.uuid4().hex[:12]
     try:
-        available=data_schema(data.kind,data.path)
+        available=data_schema(data.kind,data.path,data.auth_env)
     except Exception as exc:
         raise HTTPException(400,'数据源配置无效：'+str(exc))
     with connection() as c:
         c.execute('BEGIN IMMEDIATE');require_admin(c,user)
-        c.execute('INSERT INTO data_sources VALUES(?,?,?,?,?,?,?)',
-                  (sid,data.name,data.kind,str(Path(data.path).expanduser().resolve()),data.description,user['id'],time.time()))
+        location=data.path if data.kind=='http_json' else str(Path(data.path).expanduser().resolve())
+        c.execute('''INSERT INTO data_sources
+          (id,name,kind,path,description,created_by,created,auth_env)
+          VALUES(?,?,?,?,?,?,?,?)''',
+          (sid,data.name,data.kind,location,data.description,user['id'],time.time(),data.auth_env))
         c.execute('INSERT INTO data_source_members VALUES(?,?,?)',(sid,user['id'],'owner'))
         audit(c,user['id'],'data_source_created',sid,data.name)
     return {'id':sid,'schema':available}
@@ -301,7 +313,7 @@ def create_data_source(data: DataSourceInput, user=Depends(current_user)):
 @app.get('/api/data-sources/{sid}/schema')
 def source_schema(sid: str, user=Depends(current_user)):
     with connection() as c: source=require_data_source(c,user,sid,'analyst')
-    try: return data_schema(source['kind'],source['path'])
+    try: return data_schema(source['kind'],source['path'],source['auth_env'] or '')
     except Exception as exc: raise HTTPException(400,'无法读取数据结构：'+str(exc))
 
 @app.get('/api/data-sources/{sid}/members')
@@ -343,15 +355,18 @@ def create_metric(sid: str, data: MetricInput, user=Depends(current_user)):
 def analysis_access(c,jid,user,permission='read'):
     job=c.execute('SELECT * FROM analysis_jobs WHERE id=?',(jid,)).fetchone()
     if not job: raise HTTPException(404,'分析任务不存在或无权访问')
-    source=require_data_source(c,user,job['source_id'],'owner' if permission=='review' else 'viewer')
-    if permission=='edit' and source['my_role']!='owner':
-        if source['my_role']!='analyst' or job['created_by']!=user['id']:
+    sources=require_analysis_sources(c,user,job,'owner' if permission=='review' else 'viewer')
+    source=sources[0]
+    if permission=='edit' and not all(s['my_role']=='owner' for s in sources):
+        if not all(s['my_role'] in ('owner','analyst') for s in sources) or job['created_by']!=user['id']:
             raise HTTPException(403,'只能修改或取消自己创建的分析任务')
+    source['all_roles']=[s['my_role'] for s in sources]
     return dict(job),source
 
 def decorate_analysis(c,job,user,source):
-    job['can_edit']=source['my_role']=='owner' or (source['my_role']=='analyst' and job['created_by']==user['id'])
-    job['can_review']=source['my_role']=='owner'
+    roles=source['all_roles']
+    job['can_edit']=all(role=='owner' for role in roles) or (all(role in ('owner','analyst') for role in roles) and job['created_by']==user['id'])
+    job['can_review']=all(role=='owner' for role in roles)
     for field in ('created_by','approved_by','completed_by'):
         actor=c.execute('SELECT display_name FROM users WHERE id=?',(job[field],)).fetchone()
         job[field+'_name']=actor['display_name'] if actor else '尚未指定'
@@ -359,21 +374,36 @@ def decorate_analysis(c,job,user,source):
 
 @app.get('/api/analysis-jobs')
 def analysis_jobs(user=Depends(current_user)):
-    if user['role']=='admin':
-        return query('SELECT * FROM analysis_jobs ORDER BY created DESC')
-    return query('''SELECT j.* FROM analysis_jobs j JOIN data_source_members m ON m.source_id=j.source_id
-      WHERE m.user_id=? ORDER BY j.created DESC''',(user['id'],))
+    with connection() as c:
+        result=[]
+        for row in c.execute('''SELECT id,source_id,title,question,report_kind,status,
+          version,created,created_by,approved_by,completed_by
+          FROM analysis_jobs ORDER BY created DESC LIMIT 500'''):
+            try:
+                require_analysis_sources(c,user,row)
+                result.append(dict(row))
+            except HTTPException:
+                pass
+        return result
 
 @app.post('/api/analysis-jobs')
 def create_analysis_job(data: AnalysisInput, user=Depends(current_user)):
     jid=uuid.uuid4().hex[:12]
+    source_ids=list(dict.fromkeys(data.source_ids or [data.source_id]))
+    if not source_ids or data.source_id not in source_ids:
+        raise HTTPException(400,'主数据源必须包含在数据源列表中')
     with connection() as c:
-        c.execute('BEGIN IMMEDIATE');require_data_source(c,user,data.source_id,'analyst')
+        c.execute('BEGIN IMMEDIATE')
+        for sid in source_ids:
+            require_data_source(c,user,sid,'analyst')
         if not settings(user)['configured']: raise HTTPException(400,'请联系管理员配置模型并重启服务')
-        if not c.execute('SELECT 1 FROM metrics WHERE source_id=?',(data.source_id,)).fetchone():
-            raise HTTPException(400,'数据源尚未配置业务指标')
+        for sid in source_ids:
+            if not c.execute('SELECT 1 FROM metrics WHERE source_id=?',(sid,)).fetchone():
+                raise HTTPException(400,'所选数据源尚未配置业务指标')
         c.execute('''INSERT INTO analysis_jobs(id,source_id,title,question,report_kind,status,created_by,created)
           VALUES(?,?,?,?,?,?,?,?)''',(jid,data.source_id,data.title,data.question,data.report_kind,'pending',user['id'],time.time()))
+        c.executemany('INSERT INTO analysis_job_sources VALUES(?,?)',[(jid,sid) for sid in source_ids])
+        sync_workflow(c,'analysis',jid,'pending')
         audit(c,user['id'],'analysis_created',jid,data.report_kind)
         c.execute('INSERT INTO analysis_events(job_id,kind,message,created,actor_id) VALUES(?,?,?,?,?)',(jid,'info','分析任务已创建，等待规划',time.time(),user['id']))
     return {'id':jid}
@@ -382,7 +412,9 @@ def create_analysis_job(data: AnalysisInput, user=Depends(current_user)):
 def get_analysis_job(jid: str, user=Depends(current_user)):
     with connection() as c:
         job,source=analysis_access(c,jid,user);decorate_analysis(c,job,user,source)
-        job['source_name']=source['name']
+        job['source_ids']=job_source_ids(c,job)
+        job['source_names']=[r['name'] for r in require_analysis_sources(c,user,job)]
+        job['source_name']='、'.join(job['source_names'])
         job['events']=[dict(row) for row in c.execute('''SELECT e.*,u.display_name AS actor_name FROM analysis_events e
           LEFT JOIN users u ON u.id=e.actor_id WHERE job_id=? ORDER BY e.id''',(jid,))]
     job['query_spec']=json.loads(job['query_spec']) if job['query_spec'] else None
@@ -405,16 +437,28 @@ def export_analysis_evidence(jid: str, user=Depends(current_user)):
     rows=json.loads(job['result'])['rows']
     columns=list(dict.fromkeys(key for row in rows for key in row))
     buffer=io.StringIO();writer=csv.DictWriter(buffer,fieldnames=columns,extrasaction='ignore')
-    writer.writeheader();writer.writerows(rows)
+    def cell(value):
+        if isinstance(value,str) and value.lstrip().startswith(('=','+','-','@','\t','\r')):
+            return "'"+value
+        return value
+    writer.writeheader();writer.writerows([{key:cell(value) for key,value in row.items()} for row in rows])
     return Response(content='\ufeff'+buffer.getvalue(),media_type='text/csv; charset=utf-8',headers={
         'Content-Disposition':f'attachment; filename="evidence-{jid}.csv"'})
 
 @app.post('/api/analysis-jobs/{jid}/plan')
 def save_analysis_plan(jid: str, data: AnalysisPlan, user=Depends(current_user)):
     with connection() as c:
-        c.execute('BEGIN IMMEDIATE');analysis_access(c,jid,user,'edit')
-        changed=c.execute('''UPDATE analysis_jobs SET plan=?,version=version+1,approved=NULL,approved_by=NULL
-          WHERE id=? AND status='awaiting_approval' AND version=?''',(data.plan,jid,data.version))
+        c.execute('BEGIN IMMEDIATE');job,_=analysis_access(c,jid,user,'edit')
+        ids=job_source_ids(c,job)
+        metrics=[dict(row) for row in c.execute('SELECT * FROM metrics WHERE source_id IN ('+
+          ','.join('?' for _ in ids)+')',ids)]
+        try:
+            spec=validate_spec(data.query_spec if data.query_spec is not None else json.loads(job['query_spec']),metrics)
+        except (ValueError,TypeError,KeyError) as exc:
+            raise HTTPException(400,'指标计划无效：'+str(exc))
+        changed=c.execute('''UPDATE analysis_jobs SET plan=?,query_spec=?,version=version+1,approved=NULL,approved_by=NULL
+          WHERE id=? AND status='awaiting_approval' AND version=?''',
+          (data.plan,json.dumps(spec,ensure_ascii=False),jid,data.version))
         if changed.rowcount!=1: raise HTTPException(409,'状态或方案版本已变化，请刷新')
         audit(c,user['id'],'analysis_plan_updated',jid,str(data.version+1))
         c.execute('INSERT INTO analysis_events(job_id,kind,message,created,actor_id) VALUES(?,?,?,?,?)',(jid,'info','分析方案已修改，需要重新审批',time.time(),user['id']))
@@ -427,6 +471,7 @@ def approve_analysis(jid: str, data: Approval, user=Depends(current_user)):
         changed=c.execute('''UPDATE analysis_jobs SET approved=version,approved_by=?,status='queued'
           WHERE id=? AND status='awaiting_approval' AND version=?''',(user['id'],jid,data.version))
         if changed.rowcount!=1: raise HTTPException(409,'当前分析方案不可批准或版本已变化')
+        sync_workflow(c,'analysis',jid,'queued')
         audit(c,user['id'],'analysis_approved',jid,str(data.version))
         c.execute('INSERT INTO analysis_events(job_id,kind,message,created,actor_id) VALUES(?,?,?,?,?)',(jid,'info','负责人批准分析方案版本 '+str(data.version),time.time(),user['id']))
     return {'ok':True}
@@ -437,6 +482,7 @@ def cancel_analysis(jid: str, user=Depends(current_user)):
         c.execute('BEGIN IMMEDIATE');analysis_access(c,jid,user,'edit')
         changed=c.execute("UPDATE analysis_jobs SET status='cancelled' WHERE id=? AND status IN ('pending','planning','awaiting_approval','queued','analyzing','reporting')",(jid,))
         if changed.rowcount!=1: raise HTTPException(409,'当前状态不能取消')
+        sync_workflow(c,'analysis',jid,'cancelled')
         audit(c,user['id'],'analysis_cancelled',jid)
     return {'ok':True}
 
@@ -446,6 +492,7 @@ def complete_analysis(jid: str, user=Depends(current_user)):
         c.execute('BEGIN IMMEDIATE');analysis_access(c,jid,user,'review')
         changed=c.execute("UPDATE analysis_jobs SET status='completed',completed_by=? WHERE id=? AND status='review'",(user['id'],jid))
         if changed.rowcount!=1: raise HTTPException(409,'只有已经生成报告的任务可以验收')
+        sync_workflow(c,'analysis',jid,'completed')
         audit(c,user['id'],'analysis_completed',jid)
     return {'ok':True}
 
@@ -513,16 +560,19 @@ def task_access(c, tid, user, permission='read'):
     t=c.execute('SELECT * FROM tasks WHERE id=?',(tid,)).fetchone()
     if not t:
         raise HTTPException(404,'任务不存在或无权访问')
-    p=require_project(c,user,t['project_id'],'maintainer' if permission=='review' else 'viewer')
-    if permission=='edit' and p['my_role']!='maintainer':
-        if p['my_role']!='developer' or t['created_by']!=user['id']:
+    projects=require_task_projects(c,user,t,'maintainer' if permission=='review' else 'viewer')
+    p=projects[0]
+    p['all_roles']=[project['my_role'] for project in projects]
+    if permission=='edit' and not all(role=='maintainer' for role in p['all_roles']):
+        if not all(role in ('maintainer','developer') for role in p['all_roles']) or t['created_by']!=user['id']:
             raise HTTPException(403,'只能修改或取消自己创建的任务')
     return dict(t),p
 
 
 def decorate(c,t,user,p):
-    t['can_edit']=p['my_role']=='maintainer' or (p['my_role']=='developer' and t['created_by']==user['id'])
-    t['can_review']=p['my_role']=='maintainer'
+    roles=p['all_roles']
+    t['can_edit']=all(role=='maintainer' for role in roles) or (all(role in ('maintainer','developer') for role in roles) and t['created_by']==user['id'])
+    t['can_review']=all(role=='maintainer' for role in roles)
     for field in ('created_by','approved_by','completed_by'):
         actor=c.execute('SELECT display_name FROM users WHERE id=?',(t[field],)).fetchone()
         t[field+'_name']=actor['display_name'] if actor else '历史记录 / 系统'
@@ -531,22 +581,32 @@ def decorate(c,t,user,p):
 @app.get('/api/tasks')
 def tasks(user=Depends(current_user)):
     fields='t.id,t.project_id,t.title,t.requirement,t.acceptance,t.status,t.version,t.created,t.created_by,t.approved_by,t.completed_by'
-    if user['role']=='admin':
-        rows=query('SELECT '+fields+' FROM tasks t ORDER BY t.created DESC')
-    else:
-        rows=query('SELECT '+fields+' FROM tasks t JOIN project_members m ON m.project_id=t.project_id WHERE m.user_id=? ORDER BY t.created DESC',(user['id'],))
-    return rows
+    with connection() as c:
+        result=[]
+        for row in c.execute('SELECT '+fields+' FROM tasks t ORDER BY t.created DESC LIMIT 500'):
+            try:
+                require_task_projects(c,user,row)
+                result.append(dict(row))
+            except HTTPException:
+                pass
+        return result
 
 @app.post('/api/tasks')
 def create_task(t: Task, user=Depends(current_user)):
     tid=uuid.uuid4().hex[:12]
+    project_ids=list(dict.fromkeys(t.project_ids or [t.project_id]))
+    if not project_ids or t.project_id not in project_ids:
+        raise HTTPException(400,'主项目必须包含在目标项目列表中')
     with connection() as c:
         c.execute('BEGIN IMMEDIATE')
-        require_project(c,user,t.project_id,'developer')
+        for pid in project_ids:
+            require_project(c,user,pid,'developer')
         if not settings(user)['configured']:
             raise HTTPException(400,'请联系管理员配置模型并重启服务')
         c.execute('INSERT INTO tasks(id,project_id,title,requirement,acceptance,status,created,created_by) VALUES(?,?,?,?,?,?,?,?)',
                   (tid,t.project_id,t.title,t.requirement,t.acceptance,'pending',time.time(),user['id']))
+        c.executemany('INSERT INTO task_projects VALUES(?,?)',[(tid,pid) for pid in project_ids])
+        sync_workflow(c,'development',tid,'pending')
         audit(c,user['id'],'task_created',tid)
     event(tid,'任务已创建，等待分析',actor_id=user['id'])
     return {'id':tid}
@@ -556,6 +616,9 @@ def get_task(tid: str, user=Depends(current_user)):
     with connection() as c:
         t,p=task_access(c,tid,user)
         decorate(c,t,user,p)
+        t['project_ids']=task_project_ids(c,t)
+        t['project_runs']=[dict(row) for row in c.execute(
+            'SELECT project_id,base,worktree FROM task_project_runs WHERE task_id=?', (tid,))]
         t['events']=[dict(r) for r in c.execute('SELECT e.*,u.display_name AS actor_name FROM events e LEFT JOIN users u ON u.id=e.actor_id WHERE task_id=? ORDER BY e.id',(tid,))]
     t['result']=json.loads(t['result']) if t['result'] else None
     return t
@@ -580,6 +643,7 @@ def approve(tid: str, a: Approval, user=Depends(current_user)):
         cur=c.execute("UPDATE tasks SET approved=version,approved_by=?,status='queued' WHERE id=? AND status='awaiting_approval' AND version=?",(user['id'],tid,a.version))
         if cur.rowcount!=1:
             raise HTTPException(409,'当前方案不可批准或版本已变化')
+        sync_workflow(c,'development',tid,'queued')
         audit(c,user['id'],'plan_approved',tid,str(a.version))
     event(tid,'批准方案版本 '+str(a.version),actor_id=user['id'])
     return {'ok':True}
@@ -592,6 +656,7 @@ def cancel(tid: str, user=Depends(current_user)):
         cur=c.execute("UPDATE tasks SET status='cancelled' WHERE id=? AND status IN ('pending','analyzing','awaiting_approval','queued','running','verifying')",(tid,))
         if cur.rowcount!=1:
             raise HTTPException(409,'当前状态不能取消')
+        sync_workflow(c,'development',tid,'cancelled')
         audit(c,user['id'],'task_cancelled',tid)
     event(tid,'用户取消任务',actor_id=user['id'])
     return {'ok':True}
@@ -604,6 +669,7 @@ def complete(tid: str, user=Depends(current_user)):
         cur=c.execute("UPDATE tasks SET status='completed',completed_by=? WHERE id=? AND status='review'",(user['id'],tid))
         if cur.rowcount!=1:
             raise HTTPException(409,'只有通过验证的任务可以验收')
+        sync_workflow(c,'development',tid,'completed')
         audit(c,user['id'],'task_completed',tid)
     event(tid,'用户确认代码审查完成；代码未合并',actor_id=user['id'])
     return {'ok':True}

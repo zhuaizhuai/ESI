@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app import analysis_worker, core
+from app.analytics import _csv_metric, _sqlite_metric
 from conftest import sign_in
 
 
@@ -109,6 +110,10 @@ def test_analysis_plan_approval_execution_and_evidence(analytics_team,monkeypatc
     assert evidence.status_code==200
     assert 'metric' in evidence.text and '销售额' in evidence.text
     assert evidence.headers['content-type'].startswith('text/csv')
+    detail['result']['rows'][0]['region']='=2+2'
+    core.execute('UPDATE analysis_jobs SET result=? WHERE id=?',
+                 (json.dumps(detail['result'],ensure_ascii=False),jid))
+    assert "'=2+2" in analyst.get('/api/analysis-jobs/'+jid+'/evidence').text
     assert admin.post('/api/analysis-jobs/'+jid+'/complete',json={}).status_code==200
     assert sqlite3.connect(database).execute('SELECT COUNT(*) FROM orders').fetchone()[0]==4
 
@@ -124,3 +129,22 @@ def test_invalid_model_plan_cannot_execute(analytics_team,monkeypatch):
     core.execute("UPDATE analysis_jobs SET status='planning' WHERE id=?",(jid,))
     analysis_worker.run(job)
     assert core.query('SELECT status FROM analysis_jobs WHERE id=?',(jid,),True)['status']=='failed'
+
+
+def test_csv_and_sqlite_ignore_invalid_numeric_values_consistently(tmp_path):
+    import csv
+    csv_path=tmp_path/'values.csv'
+    with csv_path.open('w',newline='') as handle:
+        writer=csv.writer(handle)
+        writer.writerow(['region','value'])
+        writer.writerows([['east','bad'],['east','2']])
+    sqlite_path=tmp_path/'values.db'
+    with sqlite3.connect(sqlite_path) as connection:
+        connection.execute('CREATE TABLE data(region TEXT,value TEXT)')
+        connection.executemany('INSERT INTO data VALUES(?,?)',
+                               [('east','bad'),('east','2')])
+    metric={'id':'average','name':'平均值','table_name':'data','aggregation':'avg',
+            'value_column':'value','date_column':None}
+    csv_rows=_csv_metric(csv_path,metric,['region'],'none',None,None)
+    sqlite_rows=_sqlite_metric(sqlite_path,metric,['region'],'none',None,None)
+    assert csv_rows[0]['value']==sqlite_rows[0]['value']==2.0

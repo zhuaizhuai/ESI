@@ -51,7 +51,7 @@ def init_auth():
         CREATE TABLE IF NOT EXISTS data_sources (
           id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
           path TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-          created_by TEXT NOT NULL, created REAL NOT NULL
+          created_by TEXT NOT NULL, created REAL NOT NULL, auth_env TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS data_source_members (
           source_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL,
@@ -81,6 +81,57 @@ def init_auth():
         CREATE INDEX IF NOT EXISTS metrics_source ON metrics(source_id);
         CREATE INDEX IF NOT EXISTS analysis_source ON analysis_jobs(source_id,created);
         CREATE INDEX IF NOT EXISTS analysis_events_job ON analysis_events(job_id,id);
+        CREATE TABLE IF NOT EXISTS enterprise_systems (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+          owner_id TEXT NOT NULL, created REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS system_resources (
+          system_id TEXT NOT NULL, kind TEXT NOT NULL, resource_id TEXT NOT NULL,
+          PRIMARY KEY(kind,resource_id), UNIQUE(system_id,kind,resource_id)
+        );
+        CREATE TABLE IF NOT EXISTS system_dependencies (
+          source_id TEXT NOT NULL, target_id TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+          PRIMARY KEY(source_id,target_id)
+        );
+        CREATE TABLE IF NOT EXISTS knowledge_entries (
+          id TEXT PRIMARY KEY, system_id TEXT NOT NULL, title TEXT NOT NULL,
+          content TEXT NOT NULL, source_url TEXT NOT NULL DEFAULT '',
+          created_by TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS knowledge_system ON knowledge_entries(system_id,updated);
+        CREATE TABLE IF NOT EXISTS metric_terms (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, definition TEXT NOT NULL,
+          unit TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS metric_term_links (
+          metric_id TEXT PRIMARY KEY, term_id TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS analysis_job_sources (
+          job_id TEXT NOT NULL, source_id TEXT NOT NULL,
+          PRIMARY KEY(job_id,source_id)
+        );
+        CREATE TABLE IF NOT EXISTS task_projects (
+          task_id TEXT NOT NULL, project_id TEXT NOT NULL,
+          PRIMARY KEY(task_id,project_id)
+        );
+        CREATE TABLE IF NOT EXISTS task_project_runs (
+          task_id TEXT NOT NULL, project_id TEXT NOT NULL,
+          base TEXT NOT NULL, worktree TEXT NOT NULL,
+          PRIMARY KEY(task_id,project_id)
+        );
+        CREATE TABLE IF NOT EXISTS workflow_steps (
+          job_kind TEXT NOT NULL, job_id TEXT NOT NULL, step_key TEXT NOT NULL,
+          position INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          detail TEXT NOT NULL DEFAULT '', updated REAL NOT NULL,
+          PRIMARY KEY(job_kind,job_id,step_key)
+        );
+        CREATE TABLE IF NOT EXISTS recommendations (
+          id TEXT PRIMARY KEY, job_id TEXT NOT NULL, title TEXT NOT NULL,
+          action TEXT NOT NULL, success_metric TEXT NOT NULL,
+          assignee_id TEXT, status TEXT NOT NULL DEFAULT 'proposed',
+          outcome TEXT NOT NULL DEFAULT '', created REAL NOT NULL, updated REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS recommendations_job ON recommendations(job_id,created);
         ''')
         c.execute('BEGIN IMMEDIATE')
         # Additive migrations preserve all existing single-user data.
@@ -88,11 +139,16 @@ def init_auth():
             'projects': ['created_by'],
             'tasks': ['created_by', 'approved_by', 'completed_by'],
             'events': ['actor_id'],
+            'data_sources': ['auth_env'],
         }.items():
             columns = {r['name'] for r in c.execute('PRAGMA table_info('+table+')')}
             for field in fields:
                 if field not in columns:
                     c.execute(f'ALTER TABLE {table} ADD COLUMN {field} TEXT')
+        c.execute('''INSERT OR IGNORE INTO analysis_job_sources(job_id,source_id)
+                     SELECT id,source_id FROM analysis_jobs''')
+        c.execute('''INSERT OR IGNORE INTO task_projects(task_id,project_id)
+                     SELECT id,project_id FROM tasks''')
 
 
 def password_hash(password):

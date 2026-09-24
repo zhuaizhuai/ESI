@@ -10,6 +10,7 @@ import {
   BarChart3,
   FileCode2,
   FolderGit2,
+  Network,
   GitBranch,
   Layers,
   Loader2,
@@ -25,6 +26,8 @@ import "./style.css";
 import { api, SessionGate, PasswordForm, type User } from "./session";
 import { TeamAdmin, ProjectMembers, AuditLog, roleNames } from "./team";
 import { AnalysisCenter, DataCenter, type DataSource } from "./intelligence";
+import { PlatformCenter } from "./platform";
+import { WorkflowStrip } from "./workflow";
 
 type Project = {
   id: string;
@@ -37,6 +40,8 @@ type Project = {
 type Task = {
   id: string;
   project_id: string;
+  project_ids?: string[];
+  project_runs?: { project_id: string; base: string; worktree: string }[];
   title: string;
   requirement: string;
   acceptance: string;
@@ -60,7 +65,7 @@ type Task = {
   result?: {
     summary: string;
     diff: string;
-    checks: { command: string; exit_code: number; output: string }[];
+    checks: { project_id: string; project_name: string; command: string; exit_code: number; output: string }[];
   };
 };
 type Config = {
@@ -111,7 +116,8 @@ function App({
     [tab, setTab] = useState("overview"),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
-    [plan, setPlan] = useState("");
+    [plan, setPlan] = useState(""),
+    [impactHints, setImpactHints] = useState<{ project_id: string; project_name: string; system_name: string; relationship: string }[]>([]);
   const refresh = async () => {
     const [p, d, t, c] = await Promise.all([
       api("/projects"),
@@ -233,6 +239,13 @@ function App({
             数据与指标
           </button>
           <button
+            className={view === "platform" ? "active" : ""}
+            onClick={() => { setView("platform"); refresh(); }}
+          >
+            <Network size={18} />
+            企业系统与知识
+          </button>
+          <button
             className={["tasks", "detail"].includes(view) ? "active" : ""}
             onClick={() => {
               setView("tasks");
@@ -284,7 +297,7 @@ function App({
           <div className="avatar">{user.display_name.slice(0, 1)}</div>
           <div>
             {user.display_name}
-            <small>{roleNames[user.role]} · v0.3</small>
+            <small>{roleNames[user.role]} · v0.4</small>
           </div>
           <button className="logout" aria-label="退出登录" onClick={onLogout}>
             <LogOut size={16} />
@@ -303,6 +316,8 @@ function App({
               ? "经营分析"
               : view === "data"
                 ? "数据与指标"
+                : view === "platform"
+                  ? "企业系统与知识"
                 : view === "team"
                   ? "团队与账号"
                   : view === "audit"
@@ -328,9 +343,10 @@ function App({
             </div>
           )}
           {view === "analysis" && (
-            <AnalysisCenter sources={dataSources} config={config} />
+            <AnalysisCenter user={user} sources={dataSources} config={config} />
           )}
           {view === "data" && <DataCenter user={user} />}
+          {view === "platform" && <PlatformCenter user={user} projects={projects} sources={dataSources} />}
           {view === "team" && isAdmin && <TeamAdmin current={user} />}
           {view === "audit" && isAdmin && <AuditLog />}
           {view === "tasks" && (
@@ -557,7 +573,7 @@ function App({
                   <div className="eyebrow">TASK / {selected.id}</div>
                   <h1>{selected.title}</h1>
                   <p>
-                    {projects.find((p) => p.id === selected.project_id)?.name} ·{" "}
+                    {(selected.project_ids || [selected.project_id]).map((id) => projects.find((p) => p.id === id)?.name || id).join("、")} ·{" "}
                     <span className={"badge " + selected.status}>
                       {names[selected.status]}
                     </span>
@@ -572,6 +588,7 @@ function App({
                   </button>
                 )}
               </div>
+              <WorkflowStrip kind="development" jobId={selected.id} status={selected.status} />
               {config?.execution && !config.execution.available && (
                 <p className="error">
                   {config.execution.message}
@@ -739,7 +756,7 @@ function App({
                               >
                                 {c.exit_code === 0 ? "通过" : "失败"}
                               </span>{" "}
-                              {c.command}
+                              {c.project_name ? c.project_name + " · " : ""}{c.command}
                             </summary>
                             <pre>{c.output || "命令无输出"}</pre>
                           </details>
@@ -847,8 +864,11 @@ function App({
                     setModal("");
                     setView("projects");
                   } else {
+                    const selectedProjects = f.getAll("project_ids").map(String);
+                    if (!selectedProjects.length) throw new Error("请至少选择一个目标项目");
                     const t = await api("/tasks", {
-                      project_id: f.get("project"),
+                      project_id: selectedProjects[0],
+                      project_ids: selectedProjects,
                       title: f.get("title"),
                       requirement: f.get("requirement"),
                       acceptance: f.get("acceptance"),
@@ -895,19 +915,27 @@ function App({
                 </>
               ) : (
                 <>
-                  <label>
-                    目标项目
-                    <select name="project" required defaultValue="">
-                      <option value="" disabled>
-                        选择代码仓库
-                      </option>
-                      {writableProjects.map((p) => (
-                        <option value={p.id} key={p.id}>
-                          {p.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                  <fieldset className="source-picker" onChange={async (event) => {
+                    const ids = Array.from(event.currentTarget.querySelectorAll<HTMLInputElement>('input[name="project_ids"]:checked')).map((input) => input.value);
+                    if (!ids.length) { setImpactHints([]); return; }
+                    try {
+                      const suggestions = (await Promise.all(ids.map((id) => api(`/platform/impacts/${id}`)))).flat();
+                      setImpactHints(suggestions.filter((item, index, all) =>
+                        !ids.includes(item.project_id) && all.findIndex((other) => other.project_id === item.project_id) === index));
+                    } catch { setImpactHints([]); }
+                  }}>
+                    <legend>目标项目（可多选）</legend>
+                    {writableProjects.map((p) => (
+                      <label key={p.id}>
+                        <input type="checkbox" name="project_ids" value={p.id} />
+                        {p.name}
+                      </label>
+                    ))}
+                  </fieldset>
+                  {impactHints.length > 0 && <p className="hint">
+                    目录中发现相关仓库，可按需一并选择：{impactHints.map((item) =>
+                      `${item.project_name}（${item.system_name}${item.relationship ? " · " + item.relationship : ""}）`).join("、")}
+                  </p>}
                   {!projects.length && (
                     <p className="hint">请先到“项目仓库”连接一个仓库。</p>
                   )}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart3,
   Check,
@@ -12,6 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { api, type User } from "./session";
+import { WorkflowStrip } from "./workflow";
 
 type Metric = {
   id: string;
@@ -26,7 +27,7 @@ type Metric = {
 export type DataSource = {
   id: string;
   name: string;
-  kind: "sqlite" | "csv";
+  kind: "sqlite" | "csv" | "http_json";
   path: string;
   description: string;
   my_role: "owner" | "analyst" | "viewer";
@@ -38,6 +39,8 @@ type Config = { configured: boolean };
 type Job = {
   id: string;
   source_id: string;
+  source_ids?: string[];
+  source_names?: string[];
   source_name?: string;
   title: string;
   question: string;
@@ -130,6 +133,7 @@ export function DataCenter({ user }: { user: User }) {
   const [sources, setSources] = useState<DataSource[]>([]);
   const [selected, setSelected] = useState<DataSource | null>(null);
   const [mode, setMode] = useState("");
+  const [sourceKind, setSourceKind] = useState("sqlite");
   const [schema, setSchema] = useState<Record<string, string[]>>({});
   const [members, setMembers] = useState<Member[]>([]);
   const [directory, setDirectory] = useState<DirectoryUser[]>([]);
@@ -182,7 +186,7 @@ export function DataCenter({ user }: { user: User }) {
       <div className="page-title">
         <div>
           <h1>数据与指标</h1>
-          <p>连接受控数据文件，统一业务指标口径，为分析任务提供可信上下文。</p>
+          <p>连接受控文件或只读业务接口，定义指标口径，为分析任务提供可追溯的数据来源。</p>
         </div>
         {user.role === "admin" && (
           <button className="primary" onClick={() => setMode("source")}>
@@ -243,7 +247,7 @@ export function DataCenter({ user }: { user: User }) {
         <div className="empty">
           <Database size={35} />
           <h3>还没有可访问的数据源</h3>
-          <p>管理员连接 SQLite 或 CSV，配置业务指标并分配分析权限。</p>
+          <p>管理员连接 SQLite、CSV 或已批准的 HTTPS JSON 接口，配置业务指标并分配分析权限。</p>
         </div>
       )}
       {mode === "source" && (
@@ -258,6 +262,7 @@ export function DataCenter({ user }: { user: User }) {
                   kind: form.get("kind"),
                   path: form.get("path"),
                   description: form.get("description"),
+                  auth_env: String(form.get("auth_env") || ""),
                 });
                 setMode("");
               });
@@ -269,19 +274,24 @@ export function DataCenter({ user }: { user: User }) {
             </label>
             <label>
               类型
-              <select name="kind">
+              <select name="kind" value={sourceKind} onChange={(event) => setSourceKind(event.target.value)}>
                 <option value="sqlite">SQLite</option>
                 <option value="csv">CSV</option>
+                <option value="http_json">HTTPS JSON 接口</option>
               </select>
             </label>
             <label>
-              服务器文件绝对路径
+              {sourceKind === "http_json" ? "HTTPS 接口地址" : "服务器文件绝对路径"}
               <input
                 name="path"
                 required
-                placeholder="需位于 ESI_DATA_ROOTS 允许目录"
+                placeholder={sourceKind === "http_json" ? "https://api.example.internal/orders" : "需位于 ESI_DATA_ROOTS 允许目录"}
               />
             </label>
+            {sourceKind === "http_json" && <label>
+              服务端令牌环境变量（可选）
+              <input name="auth_env" placeholder="ESI_CONNECTOR_TOKEN_ORDERS" />
+            </label>}
             <label>
               数据说明
               <textarea
@@ -516,9 +526,11 @@ function MetricModal({
 }
 
 export function AnalysisCenter({
+  user,
   sources,
   config,
 }: {
+  user: User;
   sources: DataSource[];
   config: Config | null;
 }) {
@@ -526,8 +538,10 @@ export function AnalysisCenter({
     [selected, setSelected] = useState<Job | null>(null),
     [mode, setMode] = useState(""),
     [plan, setPlan] = useState(""),
+    [queryText, setQueryText] = useState(""),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false);
+  const selectedVersion = useRef<number | undefined>(undefined);
   const writable = sources.filter(
     (source) => source.my_role !== "viewer" && source.metrics.length,
   );
@@ -543,7 +557,11 @@ export function AnalysisCenter({
   const open = async (id: string, switchView = true) => {
     const job = await api("/analysis-jobs/" + id);
     setSelected(job);
-    setPlan(job.plan || "");
+    if (switchView || job.version !== selectedVersion.current) {
+      setPlan(job.plan || "");
+      setQueryText(JSON.stringify(job.query_spec || {}, null, 2));
+    }
+    selectedVersion.current = job.version;
     if (switchView) setMode("detail");
   };
   const act = async (fn: () => Promise<void>) => {
@@ -562,19 +580,22 @@ export function AnalysisCenter({
   if (mode === "detail" && selected)
     return (
       <AnalysisDetail
+        user={user}
         job={selected}
         plan={plan}
         setPlan={setPlan}
+        queryText={queryText}
+        setQueryText={setQueryText}
         error={error}
         busy={busy}
         back={() => {
           setMode("");
           setSelected(null);
+          selectedVersion.current = undefined;
           load();
         }}
-        action={(name, body) =>
-          act(() => api("/analysis-jobs/" + selected.id + "/" + name, body))
-        }
+        action={(name, body) => act(() => api("/analysis-jobs/" + selected.id + "/" + name,
+          name === "plan" ? { ...(body as object), query_spec: JSON.parse(queryText) } : body))}
       />
     );
   return (
@@ -654,8 +675,11 @@ export function AnalysisCenter({
               event.preventDefault();
               const form = new FormData(event.currentTarget);
               act(async () => {
+                const selectedSources = form.getAll("source_ids").map(String);
+                if (!selectedSources.length) throw new Error("请至少选择一个数据源");
                 const job = await api("/analysis-jobs", {
-                  source_id: form.get("source_id"),
+                  source_id: selectedSources[0],
+                  source_ids: selectedSources,
                   title: form.get("title"),
                   question: form.get("question"),
                   report_kind: form.get("report_kind"),
@@ -665,19 +689,15 @@ export function AnalysisCenter({
               });
             }}
           >
-            <label>
-              数据源
-              <select name="source_id" required defaultValue="">
-                <option value="" disabled>
-                  选择数据源
-                </option>
-                {writable.map((source) => (
-                  <option key={source.id} value={source.id}>
-                    {source.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <fieldset className="source-picker">
+              <legend>数据源（可多选）</legend>
+              {writable.map((source) => (
+                <label key={source.id}>
+                  <input type="checkbox" name="source_ids" value={source.id} />
+                  {source.name} · {source.metrics.length} 个指标
+                </label>
+              ))}
+            </fieldset>
             <label>
               任务类型
               <select name="report_kind">
@@ -717,22 +737,48 @@ export function AnalysisCenter({
 }
 
 function AnalysisDetail({
+  user,
   job,
   plan,
   setPlan,
+  queryText,
+  setQueryText,
   error,
   busy,
   back,
   action,
 }: {
+  user: User;
   job: Job;
   plan: string;
   setPlan: (value: string) => void;
+  queryText: string;
+  setQueryText: (value: string) => void;
   error: string;
   busy: boolean;
   back: () => void;
   action: (name: string, body?: unknown) => void;
 }) {
+  const [recommendations, setRecommendations] = useState<{
+    id: string; title: string; action: string; success_metric: string;
+    assignee_id?: string; assignee_name?: string; status: string; outcome: string;
+  }[]>([]);
+  const [directory, setDirectory] = useState<DirectoryUser[]>([]);
+  const [feedbackError, setFeedbackError] = useState("");
+  const loadRecommendations = () => api(`/platform/analysis-jobs/${job.id}/recommendations`).then(setRecommendations);
+  useEffect(() => {
+    loadRecommendations().catch(() => {});
+    if (job.can_review) api("/directory").then(setDirectory).catch(() => {});
+  }, [job.id, job.status, job.can_review]);
+  const recommendationAction = async (path: string, body: unknown) => {
+    setFeedbackError("");
+    try {
+      await api(path, body);
+      await loadRecommendations();
+    } catch (e) {
+      setFeedbackError((e as Error).message);
+    }
+  };
   const columns = useMemo(
     () =>
       job.result?.rows.length
@@ -770,6 +816,7 @@ function AnalysisDetail({
           )}
       </div>
       {error && <p className="error">{error}</p>}
+      <WorkflowStrip kind="analysis" jobId={job.id} status={job.status} />
       <section className="panel">
         <h2>分析问题</h2>
         <p className="hint">
@@ -792,19 +839,20 @@ function AnalysisDetail({
             {job.query_spec && (
               <div className="query-summary">
                 <strong>将执行的指标计划</strong>
-                <code>{JSON.stringify(job.query_spec, null, 2)}</code>
+                <p className="hint">实际执行以此结构化计划为准，修改后需重新审批。</p>
+                <textarea className="plan-editor" value={queryText} onChange={(event) => setQueryText(event.target.value)} rows={10} />
               </div>
             )}
             <div className="actions">
               <button
-                disabled={busy || plan === job.plan}
+                disabled={busy || (plan === job.plan && queryText === JSON.stringify(job.query_spec || {}, null, 2))}
                 onClick={() => action("plan", { plan, version: job.version })}
               >
                 保存修改
               </button>
               <button
                 className="primary"
-                disabled={busy || !job.can_review || plan !== job.plan}
+                disabled={busy || !job.can_review || plan !== job.plan || queryText !== JSON.stringify(job.query_spec || {}, null, 2)}
                 onClick={() => action("approve", { version: job.version })}
               >
                 <Check size={16} />
@@ -853,6 +901,52 @@ function AnalysisDetail({
                 </button>
               )}
             </div>
+          </section>
+          <section className="panel">
+            <h2>行动建议与反馈</h2>
+            {feedbackError && <p className="error">{feedbackError}</p>}
+            {!recommendations.length && <p className="hint">报告没有生成结构化行动建议。</p>}
+            {recommendations.map((rec) => (
+              <article className="recommendation" key={rec.id}>
+                <h3>{rec.title} <span className="badge">{rec.status}</span></h3>
+                <p className="preserve">{rec.action}</p>
+                <p className="hint">衡量指标：{rec.success_metric} · 负责人：{rec.assignee_name || "待分配"}</p>
+                {rec.outcome && <p className="preserve">执行反馈：{rec.outcome}</p>}
+                {job.can_review && (
+                  <form key={rec.assignee_id || "unassigned"} className="platform-form" onSubmit={(event) => {
+                    event.preventDefault();
+                    const form = new FormData(event.currentTarget);
+                    recommendationAction(`/platform/recommendations/${rec.id}/assign`, {
+                      assignee_id: form.get("assignee_id"),
+                    });
+                  }}>
+                    <label>分配员工<select name="assignee_id" required defaultValue={rec.assignee_id || ""}>
+                      <option value="" disabled>选择员工</option>
+                      {directory.map((person) => <option key={person.id} value={person.id}>{person.display_name}</option>)}
+                    </select></label>
+                    <button>分配</button>
+                  </form>
+                )}
+                {(job.can_review || rec.assignee_id === user.id) && !["done", "dismissed"].includes(rec.status) && (
+                  <form key={rec.status + rec.outcome} className="platform-form" onSubmit={(event) => {
+                    event.preventDefault();
+                    const form = new FormData(event.currentTarget);
+                    recommendationAction(`/platform/recommendations/${rec.id}/feedback`, {
+                      status: form.get("status"), outcome: form.get("outcome"),
+                    });
+                  }}>
+                    <label>进展<select name="status" defaultValue={rec.status === "proposed" ? "accepted" : rec.status}>
+                      <option value="accepted">已采纳</option>
+                      <option value="in_progress">执行中</option>
+                      <option value="done">已完成</option>
+                      <option value="dismissed">不采纳</option>
+                    </select></label>
+                    <label>结果与依据<textarea name="outcome" rows={2} defaultValue={rec.outcome} /></label>
+                    <button>保存反馈</button>
+                  </form>
+                )}
+              </article>
+            ))}
           </section>
           <section className="panel">
             <div className="section-heading">

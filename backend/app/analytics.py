@@ -1,13 +1,16 @@
 """Read-only enterprise data connectors and deterministic metric execution."""
 import csv
 import json
+import math
 import os
 import sqlite3
+import time
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
 
 from .core import DATA
+from .http_connector import records as http_records
 
 AGGREGATIONS = {'sum', 'avg', 'count', 'count_distinct', 'min', 'max'}
 GRAINS = {'none', 'day', 'month'}
@@ -19,7 +22,10 @@ def data_roots():
 
 
 def source_path(value):
-    path = Path(value).expanduser().resolve()
+    raw = Path(value).expanduser().absolute()
+    if raw.is_symlink() or any(parent.is_symlink() for parent in raw.parents):
+        raise ValueError('不允许读取符号链接')
+    path = raw.resolve()
     if not any(path == root or root in path.parents for root in data_roots()):
         raise ValueError('数据文件不在 ESI_DATA_ROOTS 允许的目录中')
     if not path.is_file() or path.is_symlink():
@@ -33,7 +39,13 @@ def quote(identifier):
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def schema(kind, value):
+def schema(kind, value, auth_env=''):
+    if kind == 'http_json':
+        rows = http_records(value, auth_env)
+        columns = list(dict.fromkeys(key for row in rows for key in row))
+        if not columns:
+            raise ValueError('数据接口未返回可识别字段')
+        return {'data': columns}
     path = source_path(value)
     if kind == 'csv':
         if path.suffix.lower() != '.csv':
@@ -65,7 +77,7 @@ def schema(kind, value):
 
 
 def validate_metric(source, metric):
-    available = schema(source['kind'], source['path'])
+    available = schema(source['kind'], source['path'], source.get('auth_env') or '')
     table = metric['table_name']
     if table not in available:
         raise ValueError('指标数据表不存在')
@@ -129,26 +141,75 @@ def _finish(state, aggregation):
     return state
 
 
+def _number(raw):
+    try:
+        value=float(raw)
+        return value if math.isfinite(value) else None
+    except (TypeError,ValueError):
+        return None
+
+
 def _csv_metric(path, metric, dimensions, grain, start, end):
     groups={}
+    started=time.monotonic()
     with path.open(newline='',encoding='utf-8-sig') as handle:
-        for row in csv.DictReader(handle):
+        for number,row in enumerate(csv.DictReader(handle),1):
+            if number>1_000_000:
+                raise ValueError('CSV 超过 100 万行上限，请先缩小数据范围')
+            if number%1000==0 and time.monotonic()-started>30:
+                raise ValueError('CSV 指标计算超过 30 秒，请先缩小数据范围')
             current=row.get(metric.get('date_column')) if metric.get('date_column') else None
             if start and (not current or current[:10] < start): continue
             if end and (not current or current[:10] > end): continue
-            key=tuple(row.get(item,'') for item in dimensions)
+            key=tuple(str(row.get(item) or '') for item in dimensions)
             if grain!='none': key += (_grain(current,grain),)
+            if key not in groups and len(groups)>=20_000:
+                raise ValueError('分组超过 20000 个，请缩小维度范围')
             aggregation=metric['aggregation']; raw=row.get(metric.get('value_column'))
             if aggregation=='count': groups[key]=groups.get(key,0)+1
-            elif aggregation=='count_distinct': groups.setdefault(key,set()).add(raw)
+            elif aggregation=='count_distinct':
+                if raw is None: continue
+                distinct=groups.setdefault(key,set())
+                distinct.add(raw)
+                if len(distinct)>100_000:
+                    raise ValueError('去重值超过 100000 个，请缩小数据范围')
             else:
-                try: number=float(raw)
-                except (TypeError,ValueError): continue
+                number=_number(raw)
+                if number is None: continue
                 if aggregation=='sum': groups[key]=groups.get(key,0.0)+number
                 elif aggregation=='avg':
                     total,count=groups.get(key,(0.0,0));groups[key]=(total+number,count+1)
                 elif aggregation=='min': groups[key]=number if key not in groups else min(groups[key],number)
                 elif aggregation=='max': groups[key]=number if key not in groups else max(groups[key],number)
+    return _rows(groups,metric,dimensions,grain)
+
+
+def _http_metric(rows, metric, dimensions, grain, start, end):
+    groups={}
+    for row in rows:
+        current=row.get(metric.get('date_column')) if metric.get('date_column') else None
+        current=str(current) if current is not None else None
+        if start and (not current or current[:10]<start): continue
+        if end and (not current or current[:10]>end): continue
+        key=tuple(str(row.get(item) or '') for item in dimensions)
+        if grain!='none': key+=(_grain(current,grain),)
+        if key not in groups and len(groups)>=20_000:
+            raise ValueError('分组超过 20000 个，请缩小维度范围')
+        aggregation=metric['aggregation'];raw=row.get(metric.get('value_column'))
+        if aggregation=='count': groups[key]=groups.get(key,0)+1
+        elif aggregation=='count_distinct':
+            if raw is None: continue
+            distinct=groups.setdefault(key,set());distinct.add(raw)
+            if len(distinct)>100_000:
+                raise ValueError('去重值超过 100000 个，请缩小数据范围')
+        else:
+            value=_number(raw)
+            if value is None: continue
+            if aggregation=='sum': groups[key]=groups.get(key,0.0)+value
+            elif aggregation=='avg':
+                total,count=groups.get(key,(0.0,0));groups[key]=(total+value,count+1)
+            elif aggregation=='min': groups[key]=value if key not in groups else min(groups[key],value)
+            elif aggregation=='max': groups[key]=value if key not in groups else max(groups[key],value)
     return _rows(groups,metric,dimensions,grain)
 
 
@@ -163,18 +224,29 @@ def _sqlite_metric(path, metric, dimensions, grain, start, end):
     aggregation=metric['aggregation']
     if aggregation=='count': measure='COUNT(*)'
     elif aggregation=='count_distinct': measure='COUNT(DISTINCT '+quote(metric['value_column'])+')'
-    else: measure=aggregation.upper()+'(CAST('+quote(metric['value_column'])+' AS REAL))'
+    else: measure=aggregation.upper()+'(esi_number('+quote(metric['value_column'])+'))'
     sql='SELECT '+(','.join(selected)+',' if selected else '')+measure+' AS value FROM '+quote(metric['table_name'])
     where=[];params=[]
     if start: where.append(quote(metric['date_column'])+' >= ?');params.append(start)
     if end: where.append(quote(metric['date_column'])+' <= ?');params.append(end+'T23:59:59')
     if where: sql+=' WHERE '+' AND '.join(where)
     if group: sql+=' GROUP BY '+','.join(group)
+    if aggregation not in ('count','count_distinct'):
+        sql+=' HAVING COUNT(esi_number('+quote(metric['value_column'])+')) > 0'
     sql+=' ORDER BY '+(','.join(group) if group else 'value DESC')+' LIMIT 200'
     connection=sqlite3.connect(f'file:{path}?mode=ro',uri=True,timeout=10)
     try:
+        connection.create_function('esi_number',1,_number,deterministic=True)
+        started=time.monotonic()
+        connection.set_progress_handler(lambda: int(time.monotonic()-started>30),10_000)
         result=[]
-        for values in connection.execute(sql,params).fetchall():
+        try:
+            values_list=connection.execute(sql,params).fetchall()
+        except sqlite3.OperationalError as exc:
+            if 'interrupted' in str(exc).lower():
+                raise ValueError('SQLite 指标计算超过 30 秒，请先缩小数据范围') from exc
+            raise
+        for values in values_list:
             row={label:values[index] for index,label in enumerate(labels)}
             row.update(metric_id=metric['id'],metric=metric['name'],value=values[-1])
             result.append(row)
@@ -192,17 +264,47 @@ def _rows(groups,metric,dimensions,grain):
     return rows
 
 
-def execute(source, metrics, spec):
+def execute(source, metrics, spec, remote_rows=None):
     normalized=validate_spec(spec,metrics)
     known={item['id']:item for item in metrics}
-    path=source_path(source['path'])
+    path=source_path(source['path']) if source['kind']!='http_json' else None
+    if source['kind']=='http_json' and remote_rows is None:
+        remote_rows=http_records(source['path'], source.get('auth_env') or '')
     rows=[]
     for item in normalized['items']:
         metric=known[item['metric_id']]
         if source['kind']=='sqlite':
             current=_sqlite_metric(path,metric,item['dimensions'],normalized['grain'],normalized['start_date'],normalized['end_date'])
+        elif source['kind']=='http_json':
+            current=_http_metric(remote_rows,metric,item['dimensions'],normalized['grain'],normalized['start_date'],normalized['end_date'])
         else:
             current=_csv_metric(path,metric,item['dimensions'],normalized['grain'],normalized['start_date'],normalized['end_date'])
+        rows.extend(current)
+        if len(rows)>500:
+            raise ValueError('分析结果超过 500 个聚合分组，请缩小指标或维度范围')
+    return normalized,rows
+
+
+def execute_multi(sources, metrics, spec):
+    """Execute each approved metric against its own registered source."""
+    normalized=validate_spec(spec,metrics)
+    known={item['id']:item for item in metrics}
+    source_by_id={source['id']:source for source in sources}
+    remote_cache={}
+    rows=[]
+    for item in normalized['items']:
+        metric=known[item['metric_id']]
+        source=source_by_id.get(metric['source_id'])
+        if not source:
+            raise ValueError('指标不属于本任务已授权的数据源')
+        single={'items':[item], 'grain':normalized['grain'],
+                'start_date':normalized['start_date'],'end_date':normalized['end_date']}
+        if source['kind']=='http_json' and source['id'] not in remote_cache:
+            remote_cache[source['id']]=http_records(source['path'],source.get('auth_env') or '')
+        _,current=execute(source,[metric],single,remote_cache.get(source['id']))
+        for row in current:
+            row['source_id']=source['id']
+            row['source_name']=source['name']
         rows.extend(current)
         if len(rows)>500:
             raise ValueError('分析结果超过 500 个聚合分组，请缩小指标或维度范围')

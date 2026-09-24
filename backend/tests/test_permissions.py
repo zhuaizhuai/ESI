@@ -74,6 +74,45 @@ def test_only_maintainer_can_approve_and_revoke_stops_worker(team):
     with pytest.raises(InterruptedError):worker.active(tid)
     assert core.query('SELECT status FROM tasks WHERE id=?',(tid,),True)['status']=='failed'
 
+
+def test_cross_project_task_requires_access_and_approval_for_every_project(team,tmp_path):
+    admin,users,first,_=team
+    repo=tmp_path/'second';repo.mkdir();(repo/'README.md').write_text('second')
+    subprocess.run(['git','init',str(repo)],check=True,capture_output=True)
+    subprocess.run(['git','-C',str(repo),'add','.'],check=True)
+    subprocess.run(['git','-C',str(repo),'-c','user.name=Test','-c','user.email=t@localhost',
+                    'commit','-m','init'],check=True,capture_output=True)
+    created=admin.post('/api/projects',json={'name':'Second','path':str(repo),
+                   'checks':['python3 -c "pass"']})
+    second=created.json()['id']
+    dev,dev_id=users['dev'];lead,lead_id=users['lead']
+    first_system=admin.post('/api/platform/systems',json={'name':'First'}).json()['id']
+    second_system=admin.post('/api/platform/systems',json={'name':'Second'}).json()['id']
+    for system_id,project_id in ((first_system,first),(second_system,second)):
+        assert admin.post(f'/api/platform/systems/{system_id}/resources',json={
+            'kind':'project','resource_id':project_id}).status_code==200
+    assert admin.post(f'/api/platform/systems/{first_system}/dependencies',json={
+        'target_id':second_system,'description':'调用第二系统'}).status_code==200
+    assert dev.get(f'/api/platform/impacts/{first}').json()==[]
+    payload={'project_id':first,'project_ids':[first,second],
+             'title':'Cross','requirement':'Both','acceptance':'Both pass'}
+    assert dev.post('/api/tasks',json=payload).status_code==404
+    assert admin.post(f'/api/projects/{second}/members',json={
+        'user_id':dev_id,'role':'developer'}).status_code==200
+    assert dev.get(f'/api/platform/impacts/{first}').json()[0]['project_id']==second
+    response=dev.post('/api/tasks',json=payload)
+    assert response.status_code==200,response.text
+    task_id=response.json()['id']
+    core.update(task_id,status='awaiting_approval',plan='Plan',version=1)
+    assert lead.get('/api/tasks/'+task_id).status_code==404
+    assert lead.post('/api/tasks/'+task_id+'/approve',json={'version':1}).status_code==404
+    assert admin.post(f'/api/projects/{second}/members',json={
+        'user_id':lead_id,'role':'maintainer'}).status_code==200
+    assert lead.post('/api/tasks/'+task_id+'/approve',json={'version':1}).status_code==200
+    assert admin.post(f'/api/projects/{second}/members',json={
+        'user_id':lead_id,'role':'viewer'}).status_code==200
+    with pytest.raises(InterruptedError):worker.active(task_id)
+
 def test_csrf_logout_and_expiry():
     c=TestClient(app);sign_in(c)
     token=c.cookies.get('esi_session')

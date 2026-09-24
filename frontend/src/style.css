@@ -1153,6 +1153,82 @@ textarea {
   background: #fff;
   font-weight: 500;
 }
+.platform-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+  margin-top: 14px;
+}
+.platform-form label {
+  display: grid;
+  flex: 1 1 180px;
+  gap: 6px;
+  font-size: 12px;
+  color: #667085;
+}
+.platform-form input,
+.platform-form select,
+.platform-form textarea,
+.platform-search input {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #dfe3eb;
+  border-radius: 8px;
+  font: inherit;
+  color: #263244;
+  background: #fff;
+}
+.platform-form label:has(textarea) { flex-basis: 100%; }
+.platform-search {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: 520px;
+  margin: 0 0 18px;
+  color: #667085;
+}
+.platform-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.platform-steps li {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: #f4f6f9;
+  color: #667085;
+}
+.platform-steps li.active { background: #e8efff; color: #2647a9; }
+.platform-steps li.done { background: #eaf7f0; color: #20724a; }
+.platform-steps li > span {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  font-size: 11px;
+}
+.platform-steps small { font-size: 11px; opacity: .8; }
+.source-picker {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #dfe3eb;
+  border-radius: 8px;
+  margin: 0 0 14px;
+  padding: 12px;
+}
+.source-picker label { display: flex; align-items: center; gap: 8px; }
+.source-picker input { width: auto; }
+.recommendation { border-top: 1px solid #e5e8ee; padding: 16px 0; }
 @media (max-width: 900px) {
   .auth-shell {
     gap: 40px;
