@@ -37,7 +37,9 @@ def team(tmp_path):
     dev=clients['dev'][0]
     r=dev.post('/api/tasks',json={'project_id':pid,'title':'feature','requirement':'feature','acceptance':'pass'})
     assert r.status_code==200,r.text
-    return admin,clients,pid,r.json()['id']
+    tid=r.json()['id']
+    core.update(tid,plan_schema=0,governance_version=0)
+    return admin,clients,pid,tid
 
 def test_anonymous_requests_are_rejected():
     c=TestClient(app)
@@ -103,6 +105,7 @@ def test_cross_project_task_requires_access_and_approval_for_every_project(team,
     response=dev.post('/api/tasks',json=payload)
     assert response.status_code==200,response.text
     task_id=response.json()['id']
+    core.update(task_id,plan_schema=0,governance_version=0)
     core.update(task_id,status='awaiting_approval',plan='Plan',version=1)
     assert lead.get('/api/tasks/'+task_id).status_code==404
     assert lead.post('/api/tasks/'+task_id+'/approve',json={'version':1}).status_code==404

@@ -26,7 +26,10 @@ def project(tmp_path):
 def create(pid):
     r=client.post('/api/tasks',json={'project_id':pid,'title':'增加减法','requirement':'增加 subtract','acceptance':'subtract(5, 2) == 3'})
     assert r.status_code==200
-    return r.json()['id']
+    tid=r.json()['id']
+    # Existing scenarios exercise legacy tasks; v0.5 structured plans have dedicated tests.
+    core.update(tid,plan_schema=0,governance_version=0)
+    return tid
 
 def test_path_escape_and_symlink(tmp_path):
     root=tmp_path/'root'; root.mkdir(); outside=tmp_path/'outside';outside.mkdir()
@@ -86,6 +89,7 @@ def test_two_repositories_are_researched_and_changed_after_approval(project,tmp_
        'title':'跨系统变更','requirement':'更新两个服务','acceptance':'两个仓库验证通过'})
     assert created.status_code==200,created.text
     tid=created.json()['id']
+    core.update(tid,plan_schema=0,governance_version=0)
     replies=iter([
         {'tool':'read_file','args':{'project_id':first,'path':'calculator.py'}},
         {'tool':'read_file','args':{'project_id':second,'path':'service.py'}},

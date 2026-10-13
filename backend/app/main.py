@@ -27,8 +27,27 @@ from .analytics import AGGREGATIONS, schema as data_schema, validate_metric, val
 from .platform import (router as platform_router, job_source_ids, require_analysis_sources,
                        task_project_ids, require_task_projects, sync_workflow)
 
+from .orchestration import (router as orchestration_router, ResourceApproval,
+                            approve_resources, invalidate_approvals)
+from .development import router as development_router, init_development
+from .analysis import router as analysis_router, init_analysis
+from .actions import router as actions_router
+from .http_connector import configuration as connector_configuration
+from .sources import router as sources_router
+from .acceptance import router as acceptance_router, accept_resources, AcceptanceInput
+from .orchestration import job_record
+
+init_development()
+init_analysis()
+
 app = FastAPI(title='ESI · 企业超级智能平台', docs_url=None, redoc_url=None, openapi_url=None)
 app.include_router(platform_router)
+app.include_router(orchestration_router)
+app.include_router(development_router)
+app.include_router(analysis_router)
+app.include_router(actions_router)
+app.include_router(sources_router)
+app.include_router(acceptance_router)
 ORIGINS = [x.strip().rstrip('/') for x in os.environ.get(
     'ESI_PUBLIC_ORIGIN','http://localhost:5173,http://127.0.0.1:5173').split(',') if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_credentials=True,
@@ -99,6 +118,7 @@ class DataSourceInput(BaseModel):
     path: str
     description: str = Field(default='',max_length=500)
     auth_env: str = Field(default='',max_length=100)
+    connector_config: dict = Field(default_factory=dict)
 
 class DataMember(BaseModel):
     user_id: str
@@ -284,6 +304,8 @@ def data_sources(user=Depends(current_user)):
             item['metrics']=[dict(metric) for metric in c.execute('SELECT * FROM metrics WHERE source_id=? ORDER BY created',(item['id'],))]
             for metric in item['metrics']:
                 metric['dimensions']=json.loads(metric['dimensions'])
+            item['connector_config']=json.loads(item['connector_config'] or '{}')
+            item['connector_health']=json.loads(item['connector_health'] or '{}')
             # Server file paths are restricted to owners.
             if item['my_role']!='owner':
                 item['path']='由数据负责人管理'
@@ -296,16 +318,18 @@ def create_data_source(data: DataSourceInput, user=Depends(current_user)):
     admin(user)
     sid=uuid.uuid4().hex[:12]
     try:
-        available=data_schema(data.kind,data.path,data.auth_env)
+        config=connector_configuration(data.connector_config) if data.kind=='http_json' else {}
+        available=data_schema(data.kind,data.path,data.auth_env,config)
     except Exception as exc:
         raise HTTPException(400,'数据源配置无效：'+str(exc))
     with connection() as c:
         c.execute('BEGIN IMMEDIATE');require_admin(c,user)
         location=data.path if data.kind=='http_json' else str(Path(data.path).expanduser().resolve())
         c.execute('''INSERT INTO data_sources
-          (id,name,kind,path,description,created_by,created,auth_env)
-          VALUES(?,?,?,?,?,?,?,?)''',
-          (sid,data.name,data.kind,location,data.description,user['id'],time.time(),data.auth_env))
+          (id,name,kind,path,description,created_by,created,auth_env,connector_config,connector_health)
+          VALUES(?,?,?,?,?,?,?,?,?,?)''',
+          (sid,data.name,data.kind,location,data.description,user['id'],time.time(),data.auth_env,
+               json.dumps(config),json.dumps({'status':'ok','checked_at':time.time()})))
         c.execute('INSERT INTO data_source_members VALUES(?,?,?)',(sid,user['id'],'owner'))
         audit(c,user['id'],'data_source_created',sid,data.name)
     return {'id':sid,'schema':available}
@@ -313,7 +337,7 @@ def create_data_source(data: DataSourceInput, user=Depends(current_user)):
 @app.get('/api/data-sources/{sid}/schema')
 def source_schema(sid: str, user=Depends(current_user)):
     with connection() as c: source=require_data_source(c,user,sid,'analyst')
-    try: return data_schema(source['kind'],source['path'],source['auth_env'] or '')
+    try: return data_schema(source['kind'],source['path'],source['auth_env'] or '',source.get('connector_config'))
     except Exception as exc: raise HTTPException(400,'无法读取数据结构：'+str(exc))
 
 @app.get('/api/data-sources/{sid}/members')
@@ -341,11 +365,17 @@ def set_data_member(sid: str, data: DataMember, user=Depends(current_user)):
 @app.post('/api/data-sources/{sid}/metrics')
 def create_metric(sid: str, data: MetricInput, user=Depends(current_user)):
     mid=uuid.uuid4().hex[:12]
+    # Read/validate externally first, then recheck authorization and configuration in a short transaction.
     with connection() as c:
-        c.execute('BEGIN IMMEDIATE');source=require_data_source(c,user,sid,'owner')
-        metric={**data.model_dump(),'id':mid,'source_id':sid}
-        try: validate_metric(source,metric)
-        except Exception as exc: raise HTTPException(400,'指标配置无效：'+str(exc))
+        source=require_data_source(c,user,sid,'owner')
+    metric={**data.model_dump(),'id':mid,'source_id':sid}
+    try: validate_metric(source,metric)
+    except Exception as exc: raise HTTPException(400,'指标配置无效：'+str(exc))
+    with connection() as c:
+        c.execute('BEGIN IMMEDIATE')
+        fresh=require_data_source(c,user,sid,'owner')
+        if any(fresh.get(k)!=source.get(k) for k in ('kind','path','auth_env','connector_config')):
+            raise HTTPException(409,'校验期间数据源配置已变化，请重试')
         c.execute('INSERT INTO metrics VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                   (mid,sid,data.name,data.description,data.table_name,data.aggregation,
                    data.value_column,data.date_column,json.dumps(data.dimensions,ensure_ascii=False),user['id'],time.time()))
@@ -400,8 +430,8 @@ def create_analysis_job(data: AnalysisInput, user=Depends(current_user)):
         for sid in source_ids:
             if not c.execute('SELECT 1 FROM metrics WHERE source_id=?',(sid,)).fetchone():
                 raise HTTPException(400,'所选数据源尚未配置业务指标')
-        c.execute('''INSERT INTO analysis_jobs(id,source_id,title,question,report_kind,status,created_by,created)
-          VALUES(?,?,?,?,?,?,?,?)''',(jid,data.source_id,data.title,data.question,data.report_kind,'pending',user['id'],time.time()))
+        c.execute('''INSERT INTO analysis_jobs(id,source_id,title,question,report_kind,status,created_by,created,governance_version)
+          VALUES(?,?,?,?,?,?,?,?,1)''',(jid,data.source_id,data.title,data.question,data.report_kind,'pending',user['id'],time.time()))
         c.executemany('INSERT INTO analysis_job_sources VALUES(?,?)',[(jid,sid) for sid in source_ids])
         sync_workflow(c,'analysis',jid,'pending')
         audit(c,user['id'],'analysis_created',jid,data.report_kind)
@@ -450,8 +480,8 @@ def save_analysis_plan(jid: str, data: AnalysisPlan, user=Depends(current_user))
     with connection() as c:
         c.execute('BEGIN IMMEDIATE');job,_=analysis_access(c,jid,user,'edit')
         ids=job_source_ids(c,job)
-        metrics=[dict(row) for row in c.execute('SELECT * FROM metrics WHERE source_id IN ('+
-          ','.join('?' for _ in ids)+')',ids)]
+        from .analysis import load_catalog
+        _,metrics=load_catalog(c,job)
         try:
             spec=validate_spec(data.query_spec if data.query_spec is not None else json.loads(job['query_spec']),metrics)
         except (ValueError,TypeError,KeyError) as exc:
@@ -460,21 +490,14 @@ def save_analysis_plan(jid: str, data: AnalysisPlan, user=Depends(current_user))
           WHERE id=? AND status='awaiting_approval' AND version=?''',
           (data.plan,json.dumps(spec,ensure_ascii=False),jid,data.version))
         if changed.rowcount!=1: raise HTTPException(409,'状态或方案版本已变化，请刷新')
+        invalidate_approvals(c,'analysis',jid)
         audit(c,user['id'],'analysis_plan_updated',jid,str(data.version+1))
         c.execute('INSERT INTO analysis_events(job_id,kind,message,created,actor_id) VALUES(?,?,?,?,?)',(jid,'info','分析方案已修改，需要重新审批',time.time(),user['id']))
     return {'ok':True}
 
 @app.post('/api/analysis-jobs/{jid}/approve')
 def approve_analysis(jid: str, data: Approval, user=Depends(current_user)):
-    with connection() as c:
-        c.execute('BEGIN IMMEDIATE');analysis_access(c,jid,user,'review')
-        changed=c.execute('''UPDATE analysis_jobs SET approved=version,approved_by=?,status='queued'
-          WHERE id=? AND status='awaiting_approval' AND version=?''',(user['id'],jid,data.version))
-        if changed.rowcount!=1: raise HTTPException(409,'当前分析方案不可批准或版本已变化')
-        sync_workflow(c,'analysis',jid,'queued')
-        audit(c,user['id'],'analysis_approved',jid,str(data.version))
-        c.execute('INSERT INTO analysis_events(job_id,kind,message,created,actor_id) VALUES(?,?,?,?,?)',(jid,'info','负责人批准分析方案版本 '+str(data.version),time.time(),user['id']))
-    return {'ok':True}
+    return approve_resources('analysis',jid,ResourceApproval(version=data.version),user,require_all=True)
 
 @app.post('/api/analysis-jobs/{jid}/cancel')
 def cancel_analysis(jid: str, user=Depends(current_user)):
@@ -489,12 +512,8 @@ def cancel_analysis(jid: str, user=Depends(current_user)):
 @app.post('/api/analysis-jobs/{jid}/complete')
 def complete_analysis(jid: str, user=Depends(current_user)):
     with connection() as c:
-        c.execute('BEGIN IMMEDIATE');analysis_access(c,jid,user,'review')
-        changed=c.execute("UPDATE analysis_jobs SET status='completed',completed_by=? WHERE id=? AND status='review'",(user['id'],jid))
-        if changed.rowcount!=1: raise HTTPException(409,'只有已经生成报告的任务可以验收')
-        sync_workflow(c,'analysis',jid,'completed')
-        audit(c,user['id'],'analysis_completed',jid)
-    return {'ok':True}
+        job=job_record(c,'analysis',jid)
+    return accept_resources('analysis',jid,AcceptanceInput(version=job['version']),user,require_all=True)
 
 @app.get('/api/projects')
 def projects(user=Depends(current_user)):
@@ -603,7 +622,7 @@ def create_task(t: Task, user=Depends(current_user)):
             require_project(c,user,pid,'developer')
         if not settings(user)['configured']:
             raise HTTPException(400,'请联系管理员配置模型并重启服务')
-        c.execute('INSERT INTO tasks(id,project_id,title,requirement,acceptance,status,created,created_by) VALUES(?,?,?,?,?,?,?,?)',
+        c.execute('INSERT INTO tasks(id,project_id,title,requirement,acceptance,status,created,created_by,plan_schema,governance_version) VALUES(?,?,?,?,?,?,?,?,1,1)',
                   (tid,t.project_id,t.title,t.requirement,t.acceptance,'pending',time.time(),user['id']))
         c.executemany('INSERT INTO task_projects VALUES(?,?)',[(tid,pid) for pid in project_ids])
         sync_workflow(c,'development',tid,'pending')
@@ -628,25 +647,17 @@ def save_plan(tid: str, p: Plan, user=Depends(current_user)):
     with connection() as c:
         c.execute('BEGIN IMMEDIATE')
         task_access(c,tid,user,'edit')
-        cur=c.execute("UPDATE tasks SET plan=?,version=version+1,approved=NULL,approved_by=NULL WHERE id=? AND status='awaiting_approval' AND version=?",(p.plan,tid,p.version))
+        cur=c.execute("UPDATE tasks SET plan=?,structured_plan=NULL,validation_snapshot=NULL,version=version+1,approved=NULL,approved_by=NULL WHERE id=? AND status='awaiting_approval' AND version=?",(p.plan,tid,p.version))
         if cur.rowcount!=1:
             raise HTTPException(409,'状态或方案版本已变化，请刷新')
+        invalidate_approvals(c,'development',tid)
         audit(c,user['id'],'plan_updated',tid,str(p.version+1))
     event(tid,'方案已修改，需要批准新版本',actor_id=user['id'])
     return {'ok':True}
 
 @app.post('/api/tasks/{tid}/approve')
 def approve(tid: str, a: Approval, user=Depends(current_user)):
-    with connection() as c:
-        c.execute('BEGIN IMMEDIATE')
-        task_access(c,tid,user,'review')
-        cur=c.execute("UPDATE tasks SET approved=version,approved_by=?,status='queued' WHERE id=? AND status='awaiting_approval' AND version=?",(user['id'],tid,a.version))
-        if cur.rowcount!=1:
-            raise HTTPException(409,'当前方案不可批准或版本已变化')
-        sync_workflow(c,'development',tid,'queued')
-        audit(c,user['id'],'plan_approved',tid,str(a.version))
-    event(tid,'批准方案版本 '+str(a.version),actor_id=user['id'])
-    return {'ok':True}
+    return approve_resources('development',tid,ResourceApproval(version=a.version),user,require_all=True)
 
 @app.post('/api/tasks/{tid}/cancel')
 def cancel(tid: str, user=Depends(current_user)):
@@ -664,15 +675,8 @@ def cancel(tid: str, user=Depends(current_user)):
 @app.post('/api/tasks/{tid}/complete')
 def complete(tid: str, user=Depends(current_user)):
     with connection() as c:
-        c.execute('BEGIN IMMEDIATE')
-        task_access(c,tid,user,'review')
-        cur=c.execute("UPDATE tasks SET status='completed',completed_by=? WHERE id=? AND status='review'",(user['id'],tid))
-        if cur.rowcount!=1:
-            raise HTTPException(409,'只有通过验证的任务可以验收')
-        sync_workflow(c,'development',tid,'completed')
-        audit(c,user['id'],'task_completed',tid)
-    event(tid,'用户确认代码审查完成；代码未合并',actor_id=user['id'])
-    return {'ok':True}
+        job=job_record(c,'development',tid)
+    return accept_resources('development',tid,AcceptanceInput(version=job['version']),user,require_all=True)
 
 @app.get('/api/tasks/{tid}/stream')
 async def stream(tid: str, request: Request, user=Depends(current_user)):

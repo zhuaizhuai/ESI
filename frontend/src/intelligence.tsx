@@ -13,6 +13,13 @@ import {
 } from "lucide-react";
 import { api, type User } from "./session";
 import { WorkflowStrip } from "./workflow";
+import {
+  AnalysisBrief,
+  EvidencePanel,
+  ResourceApprovals,
+  RetryTask,
+} from "./capabilities";
+import { ActionCard, type ActionItem } from "./actions";
 
 type Metric = {
   id: string;
@@ -32,6 +39,18 @@ export type DataSource = {
   description: string;
   my_role: "owner" | "analyst" | "viewer";
   metrics: Metric[];
+  connector_config?: {
+    pagination: string;
+    next_field: string;
+    max_pages: number;
+    retries: number;
+  };
+  connector_health?: {
+    status?: string;
+    message?: string;
+    last_success_at?: number;
+    checked_at?: number;
+  };
 };
 type DirectoryUser = { id: string; username: string; display_name: string };
 type Member = DirectoryUser & { user_id: string; role: string; active: number };
@@ -186,7 +205,9 @@ export function DataCenter({ user }: { user: User }) {
       <div className="page-title">
         <div>
           <h1>数据与指标</h1>
-          <p>连接受控文件或只读业务接口，定义指标口径，为分析任务提供可追溯的数据来源。</p>
+          <p>
+            连接受控文件或只读业务接口，定义指标口径，为分析任务提供可追溯的数据来源。
+          </p>
         </div>
         {user.role === "admin" && (
           <button className="primary" onClick={() => setMode("source")}>
@@ -209,6 +230,36 @@ export function DataCenter({ user }: { user: User }) {
             </h2>
             <p>{source.description || "尚未填写数据说明"}</p>
             <code>{source.path}</code>
+            {source.connector_config && source.kind === "http_json" && (
+              <p className="hint">
+                {source.connector_config.pagination === "next_url"
+                  ? `分页读取 · 最多 ${source.connector_config.max_pages} 页`
+                  : "单页读取"}{" "}
+                · 重试 {source.connector_config.retries} 次
+              </p>
+            )}
+            {source.connector_health && (
+              <p
+                className={
+                  source.connector_health.status === "error"
+                    ? "warning-note"
+                    : "hint"
+                }
+              >
+                连接状态：
+                {source.connector_health.status === "ok"
+                  ? "正常"
+                  : source.connector_health.status === "error"
+                    ? "连接异常"
+                    : "尚未检查"}
+                {source.connector_health.message
+                  ? ` · ${source.connector_health.message}`
+                  : ""}
+                {source.connector_health.checked_at
+                  ? ` · ${new Date(source.connector_health.checked_at * 1000).toLocaleString()}`
+                  : ""}
+              </p>
+            )}
             <div className="metric-list">
               <div className="command-label">
                 业务指标 · {source.metrics.length}
@@ -230,6 +281,16 @@ export function DataCenter({ user }: { user: User }) {
             </div>
             {source.my_role === "owner" && (
               <div className="compact-actions">
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    act(async () => {
+                      await api(`/data-sources/${source.id}/health`, {});
+                    })
+                  }
+                >
+                  {busy ? "处理中…" : "检查连接"}
+                </button>
                 <button onClick={() => openMetric(source)}>
                   <Settings2 size={15} />
                   配置指标
@@ -247,7 +308,10 @@ export function DataCenter({ user }: { user: User }) {
         <div className="empty">
           <Database size={35} />
           <h3>还没有可访问的数据源</h3>
-          <p>管理员连接 SQLite、CSV 或已批准的 HTTPS JSON 接口，配置业务指标并分配分析权限。</p>
+          <p>
+            管理员连接 SQLite、CSV 或已批准的 HTTPS JSON
+            接口，配置业务指标并分配分析权限。
+          </p>
         </div>
       )}
       {mode === "source" && (
@@ -263,6 +327,15 @@ export function DataCenter({ user }: { user: User }) {
                   path: form.get("path"),
                   description: form.get("description"),
                   auth_env: String(form.get("auth_env") || ""),
+                  connector_config:
+                    sourceKind === "http_json"
+                      ? {
+                          pagination: form.get("pagination"),
+                          next_field: form.get("next_field"),
+                          max_pages: Number(form.get("max_pages")),
+                          retries: Number(form.get("retries")),
+                        }
+                      : {},
                 });
                 setMode("");
               });
@@ -274,24 +347,80 @@ export function DataCenter({ user }: { user: User }) {
             </label>
             <label>
               类型
-              <select name="kind" value={sourceKind} onChange={(event) => setSourceKind(event.target.value)}>
+              <select
+                name="kind"
+                value={sourceKind}
+                onChange={(event) => setSourceKind(event.target.value)}
+              >
                 <option value="sqlite">SQLite</option>
                 <option value="csv">CSV</option>
                 <option value="http_json">HTTPS JSON 接口</option>
               </select>
             </label>
             <label>
-              {sourceKind === "http_json" ? "HTTPS 接口地址" : "服务器文件绝对路径"}
+              {sourceKind === "http_json"
+                ? "HTTPS 接口地址"
+                : "服务器文件绝对路径"}
               <input
                 name="path"
                 required
-                placeholder={sourceKind === "http_json" ? "https://api.example.internal/orders" : "需位于 ESI_DATA_ROOTS 允许目录"}
+                placeholder={
+                  sourceKind === "http_json"
+                    ? "https://api.example.internal/orders"
+                    : "需位于 ESI_DATA_ROOTS 允许目录"
+                }
               />
             </label>
-            {sourceKind === "http_json" && <label>
-              服务端令牌环境变量（可选）
-              <input name="auth_env" placeholder="ESI_CONNECTOR_TOKEN_ORDERS" />
-            </label>}
+            {sourceKind === "http_json" && (
+              <label>
+                服务端令牌环境变量（可选）
+                <input
+                  name="auth_env"
+                  placeholder="ESI_CONNECTOR_TOKEN_ORDERS"
+                />
+              </label>
+            )}
+            {sourceKind === "http_json" && (
+              <details>
+                <summary>分页与连接恢复</summary>
+                <div className="field-grid">
+                  <label>
+                    分页方式
+                    <select name="pagination" defaultValue="none">
+                      <option value="none">单页</option>
+                      <option value="next_url">响应包含下一页链接</option>
+                    </select>
+                  </label>
+                  <label>
+                    下一页字段
+                    <input name="next_field" defaultValue="next" />
+                  </label>
+                  <label>
+                    最大页数
+                    <input
+                      type="number"
+                      name="max_pages"
+                      defaultValue={10}
+                      min={1}
+                      max={50}
+                    />
+                  </label>
+                  <label>
+                    失败重试次数
+                    <input
+                      type="number"
+                      name="retries"
+                      defaultValue={1}
+                      min={0}
+                      max={2}
+                    />
+                  </label>
+                </div>
+                <p className="hint">
+                  分页链接必须与起始接口同源；超过页数或总量限制会明确报错。
+                </p>
+              </details>
+            )}
             <label>
               数据说明
               <textarea
@@ -584,6 +713,7 @@ export function AnalysisCenter({
         job={selected}
         plan={plan}
         setPlan={setPlan}
+        reload={() => open(selected.id, false)}
         queryText={queryText}
         setQueryText={setQueryText}
         error={error}
@@ -594,8 +724,16 @@ export function AnalysisCenter({
           selectedVersion.current = undefined;
           load();
         }}
-        action={(name, body) => act(() => api("/analysis-jobs/" + selected.id + "/" + name,
-          name === "plan" ? { ...(body as object), query_spec: JSON.parse(queryText) } : body))}
+        action={(name, body) =>
+          act(() =>
+            api(
+              "/analysis-jobs/" + selected.id + "/" + name,
+              name === "plan"
+                ? { ...(body as object), query_spec: JSON.parse(queryText) }
+                : body,
+            ),
+          )
+        }
       />
     );
   return (
@@ -676,7 +814,8 @@ export function AnalysisCenter({
               const form = new FormData(event.currentTarget);
               act(async () => {
                 const selectedSources = form.getAll("source_ids").map(String);
-                if (!selectedSources.length) throw new Error("请至少选择一个数据源");
+                if (!selectedSources.length)
+                  throw new Error("请至少选择一个数据源");
                 const job = await api("/analysis-jobs", {
                   source_id: selectedSources[0],
                   source_ids: selectedSources,
@@ -747,6 +886,7 @@ function AnalysisDetail({
   busy,
   back,
   action,
+  reload,
 }: {
   user: User;
   job: Job;
@@ -758,27 +898,19 @@ function AnalysisDetail({
   busy: boolean;
   back: () => void;
   action: (name: string, body?: unknown) => void;
+  reload: () => Promise<void>;
 }) {
-  const [recommendations, setRecommendations] = useState<{
-    id: string; title: string; action: string; success_metric: string;
-    assignee_id?: string; assignee_name?: string; status: string; outcome: string;
-  }[]>([]);
-  const [directory, setDirectory] = useState<DirectoryUser[]>([]);
+  const [recommendations, setRecommendations] = useState<ActionItem[]>([]);
   const [feedbackError, setFeedbackError] = useState("");
-  const loadRecommendations = () => api(`/platform/analysis-jobs/${job.id}/recommendations`).then(setRecommendations);
-  useEffect(() => {
-    loadRecommendations().catch(() => {});
-    if (job.can_review) api("/directory").then(setDirectory).catch(() => {});
-  }, [job.id, job.status, job.can_review]);
-  const recommendationAction = async (path: string, body: unknown) => {
-    setFeedbackError("");
-    try {
-      await api(path, body);
-      await loadRecommendations();
-    } catch (e) {
-      setFeedbackError((e as Error).message);
-    }
+  const [briefDirty, setBriefDirty] = useState(false);
+  const loadRecommendations = async () => {
+    setRecommendations(
+      await api(`/platform/analysis-jobs/${job.id}/recommendations`),
+    );
   };
+  useEffect(() => {
+    loadRecommendations().catch((e) => setFeedbackError(e.message));
+  }, [job.id, job.status]);
   const columns = useMemo(
     () =>
       job.result?.rows.length
@@ -817,6 +949,21 @@ function AnalysisDetail({
       </div>
       {error && <p className="error">{error}</p>}
       <WorkflowStrip kind="analysis" jobId={job.id} status={job.status} />
+      <RetryTask
+        kind="analysis"
+        id={job.id}
+        status={job.status}
+        canEdit={job.can_edit}
+        onChanged={reload}
+      />
+      <AnalysisBrief
+        id={job.id}
+        version={job.version}
+        status={job.status}
+        canEdit={job.can_edit}
+        onChanged={reload}
+        onDirtyChanged={setBriefDirty}
+      />
       <section className="panel">
         <h2>分析问题</h2>
         <p className="hint">
@@ -837,26 +984,74 @@ function AnalysisDetail({
               onChange={(event) => setPlan(event.target.value)}
             />
             {job.query_spec && (
-              <div className="query-summary">
-                <strong>将执行的指标计划</strong>
-                <p className="hint">实际执行以此结构化计划为准，修改后需重新审批。</p>
-                <textarea className="plan-editor" value={queryText} onChange={(event) => setQueryText(event.target.value)} rows={10} />
-              </div>
+              <details className="query-summary">
+                <summary>高级：编辑指标计算计划</summary>
+                <p className="hint">
+                  实际执行以此结构化计划为准，修改后需重新审批。
+                </p>
+                <p className="hint">
+                  可配置跨源维度对齐、指标比较和算术情景。情景计算不是预测。
+                </p>
+                <details>
+                  <summary>查看配置示例</summary>
+                  <pre className="prose">
+                    {JSON.stringify(
+                      {
+                        items: [
+                          {
+                            metric_id: "current",
+                            dimensions: ["region"],
+                            dimension_aliases: { region: "area" },
+                          },
+                          { metric_id: "past", dimensions: ["area"] },
+                        ],
+                        grain: "none",
+                        comparisons: [
+                          {
+                            id: "growth",
+                            name: "同比",
+                            operation: "percentage_change",
+                            left_metric_id: "current",
+                            right_metric_id: "past",
+                            dimensions: ["area"],
+                          },
+                        ],
+                        scenarios: [
+                          {
+                            id: "up10",
+                            name: "增长10%情景",
+                            metric_id: "current",
+                            change_percent: 10,
+                          },
+                        ],
+                      },
+                      null,
+                      2,
+                    )}
+                  </pre>
+                  <p className="hint">
+                    请替换为当前任务实际指标ID；百分比与差值比较需要相同单位。
+                  </p>
+                </details>
+                <textarea
+                  className="plan-editor"
+                  aria-label="指标计算计划"
+                  value={queryText}
+                  onChange={(event) => setQueryText(event.target.value)}
+                  rows={10}
+                />
+              </details>
             )}
             <div className="actions">
               <button
-                disabled={busy || (plan === job.plan && queryText === JSON.stringify(job.query_spec || {}, null, 2))}
+                disabled={
+                  busy ||
+                  (plan === job.plan &&
+                    queryText === JSON.stringify(job.query_spec || {}, null, 2))
+                }
                 onClick={() => action("plan", { plan, version: job.version })}
               >
                 保存修改
-              </button>
-              <button
-                className="primary"
-                disabled={busy || !job.can_review || plan !== job.plan || queryText !== JSON.stringify(job.query_spec || {}, null, 2)}
-                onClick={() => action("approve", { version: job.version })}
-              >
-                <Check size={16} />
-                {job.can_review ? "批准并生成报告" : "等待数据负责人批准"}
               </button>
             </div>
           </>
@@ -866,6 +1061,21 @@ function AnalysisDetail({
           <p className="hint">正在根据指标目录生成分析方案…</p>
         )}
       </section>
+      <ResourceApprovals
+        kind="analysis"
+        id={job.id}
+        version={job.version}
+        status={job.status}
+        dirty={
+          briefDirty ||
+          plan !== (job.plan || "") ||
+          queryText !== JSON.stringify(job.query_spec || {}, null, 2)
+        }
+        onChanged={reload}
+      />
+      {job.result && (
+        <EvidencePanel kind="analysis" id={job.id} status={job.status} />
+      )}
       {job.result && (
         <>
           <section className="panel report">
@@ -905,47 +1115,17 @@ function AnalysisDetail({
           <section className="panel">
             <h2>行动建议与反馈</h2>
             {feedbackError && <p className="error">{feedbackError}</p>}
-            {!recommendations.length && <p className="hint">报告没有生成结构化行动建议。</p>}
+            {!recommendations.length && (
+              <p className="hint">报告没有生成结构化行动建议。</p>
+            )}
             {recommendations.map((rec) => (
-              <article className="recommendation" key={rec.id}>
-                <h3>{rec.title} <span className="badge">{rec.status}</span></h3>
-                <p className="preserve">{rec.action}</p>
-                <p className="hint">衡量指标：{rec.success_metric} · 负责人：{rec.assignee_name || "待分配"}</p>
-                {rec.outcome && <p className="preserve">执行反馈：{rec.outcome}</p>}
-                {job.can_review && (
-                  <form key={rec.assignee_id || "unassigned"} className="platform-form" onSubmit={(event) => {
-                    event.preventDefault();
-                    const form = new FormData(event.currentTarget);
-                    recommendationAction(`/platform/recommendations/${rec.id}/assign`, {
-                      assignee_id: form.get("assignee_id"),
-                    });
-                  }}>
-                    <label>分配员工<select name="assignee_id" required defaultValue={rec.assignee_id || ""}>
-                      <option value="" disabled>选择员工</option>
-                      {directory.map((person) => <option key={person.id} value={person.id}>{person.display_name}</option>)}
-                    </select></label>
-                    <button>分配</button>
-                  </form>
-                )}
-                {(job.can_review || rec.assignee_id === user.id) && !["done", "dismissed"].includes(rec.status) && (
-                  <form key={rec.status + rec.outcome} className="platform-form" onSubmit={(event) => {
-                    event.preventDefault();
-                    const form = new FormData(event.currentTarget);
-                    recommendationAction(`/platform/recommendations/${rec.id}/feedback`, {
-                      status: form.get("status"), outcome: form.get("outcome"),
-                    });
-                  }}>
-                    <label>进展<select name="status" defaultValue={rec.status === "proposed" ? "accepted" : rec.status}>
-                      <option value="accepted">已采纳</option>
-                      <option value="in_progress">执行中</option>
-                      <option value="done">已完成</option>
-                      <option value="dismissed">不采纳</option>
-                    </select></label>
-                    <label>结果与依据<textarea name="outcome" rows={2} defaultValue={rec.outcome} /></label>
-                    <button>保存反馈</button>
-                  </form>
-                )}
-              </article>
+              <ActionCard
+                key={rec.id}
+                item={rec}
+                user={user}
+                canManage={Boolean(job.can_review)}
+                onChanged={loadRecommendations}
+              />
             ))}
           </section>
           <section className="panel">

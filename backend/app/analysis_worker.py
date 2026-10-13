@@ -4,9 +4,10 @@ import time
 
 from fastapi import HTTPException
 
-from .analytics import execute_multi, validate_spec
-from .core import connection, event, query
-from .platform import job_source_ids, require_analysis_sources, sync_workflow
+from .analytics import execute_with_evidence, validate_spec
+from .analysis import check_approval_snapshot, load_catalog
+from .core import connection
+from .platform import require_analysis_sources, sync_workflow
 from .worker import model
 
 
@@ -34,13 +35,12 @@ def active(jid):
             if not creator: raise HTTPException(403,'分析任务缺少有效创建人')
             require_analysis_sources(c,dict(creator),job,'analyst')
             if job['status'] in ('queued','analyzing','reporting'):
-                approver=c.execute('SELECT * FROM users WHERE id=?',(job['approved_by'],)).fetchone()
-                if not approver or job['approved']!=job['version']:
-                    raise HTTPException(403,'分析方案缺少有效审批')
-                require_analysis_sources(c,dict(approver),job,'owner')
+                from .orchestration import require_execution_approvals
+                require_execution_approvals(c,'analysis',dict(job))
         except HTTPException as exc:
-            c.execute("UPDATE analysis_jobs SET status='failed' WHERE id=? AND status NOT IN ('cancelled','interrupted')",(jid,))
-            sync_workflow(c,'analysis',jid,'failed')
+            changed=c.execute("UPDATE analysis_jobs SET status='failed' WHERE id=? AND status NOT IN ('cancelled','interrupted')",(jid,))
+            if changed.rowcount:
+                sync_workflow(c,'analysis',jid,'failed')
             c.commit()
             raise InterruptedError('分析授权已失效：'+str(exc.detail))
         return dict(job)
@@ -48,6 +48,7 @@ def active(jid):
 
 def _context(job,sources,metrics):
     return {'question':job['question'],'report_kind':job['report_kind'],
+            'brief':json.loads(job.get('brief') or '{}'),
             'sources':[{'id':s['id'],'name':s['name'],'kind':s['kind']} for s in sources],
             'metrics':[{'id':m['id'],'name':m['name'],'description':m['description'],
                         'source_id':m['source_id'],
@@ -67,15 +68,16 @@ def plan(job,sources,metrics):
     return response['plan'],spec
 
 
-def report(job,sources,metrics,spec,rows):
+def report(job,sources,metrics,spec,rows,evidence=None):
     kind='战略建议' if job['report_kind']=='strategy' else '经营分析报告'
-    prompt=f'''你是企业经营分析助手。根据已经由系统计算的聚合指标编写中文{kind}。数据行是唯一数值证据，严禁编造数字或声称因果关系已经得到证明。明确数据范围、指标口径、观察、风险和下一步。战略建议必须列出假设、至少两个方案、衡量指标和验证方法。返回 JSON：{{"done":true,"summary":"Markdown 报告","recommendations":[{{"title":"建议标题","action":"可执行动作","success_metric":"衡量效果的指标"}}]}}。建议最多 8 条，没有充分证据时返回空数组。'''
-    evidence={'question':job['question'],'plan':job['plan'],'query':spec,
+    prompt=f'''你是企业经营分析助手。根据系统聚合指标编写中文{kind}。数据行和calculations是唯一数值证据，严禁编造数字或把相关性当已证实因果。报告注明数据范围、质量缺口、口径、风险和下一步。情景计算仅是固定比例假设，不是预测。战略建议列明假设、至少两个方案、成本约束、衡量指标和验证方法。返回 JSON：{{"done":true,"summary":"Markdown 报告","claims":[{{"text":"观察结论","evidence_ids":["已有证据ID"],"kind":"observation|hypothesis|scenario"}}],"recommendations":[{{"title":"建议标题","action":"可执行动作","success_metric":"衡量效果的指标"}}]}}。每条claim引用至少一个已有evidence_id，最多30条。建议最多8条，证据不足返回空数组。claims引用验证不能代替人工核对正文数值与推理。'''
+    payload={'question':job['question'],'plan':job['plan'],'query':spec,
+              'brief':json.loads(job.get('brief') or '{}'),
               'metrics':[{'name':m['name'],'description':m['description'],'aggregation':m['aggregation'],
                           'unified_name':m.get('term_name'),'unified_definition':m.get('term_definition'),
                           'unit':m.get('term_unit')} for m in metrics if any(i['metric_id']==m['id'] for i in spec['items'])],
-              'rows':rows}
-    response=model([{'role':'system','content':prompt},{'role':'user','content':json.dumps(evidence,ensure_ascii=False)}])
+              'rows':rows,'evidence':evidence or {}}
+    response=model([{'role':'system','content':prompt},{'role':'user','content':json.dumps(payload,ensure_ascii=False)}])
     response.pop('_usage',None)
     if response.get('done') is not True or not isinstance(response.get('summary'),str):
         raise ValueError('模型没有返回有效报告')
@@ -88,7 +90,20 @@ def report(job,sources,metrics,spec,rows):
            for key in ('title','action','success_metric')):
             raise ValueError('模型返回的建议缺少动作或衡量指标')
         cleaned.append({key:item[key][:2000] for key in ('title','action','success_metric')})
-    return response['summary'],cleaned
+    claims=response.get('claims')
+    if claims is None:
+        return response['summary']+'\n\n> 模型文本未提供结构化证据引用，需人工审核。',cleaned,[], 'legacy_unverified'
+    if not isinstance(claims,list) or not 1<=len(claims)<=30:
+        raise ValueError('报告必须提供 1–30 条可追溯结论')
+    valid={r['evidence_id'] for r in rows}
+    valid.update(r['evidence_id'] for r in (evidence or {}).get('calculations',[]))
+    for claim in claims:
+        if not isinstance(claim,dict) or not isinstance(claim.get('text'),str) or not claim['text'].strip() or len(claim['text'])>4000 or claim.get('kind') not in {'observation','hypothesis','scenario'}:
+            raise ValueError('报告结论格式无效')
+        references=claim.get('evidence_ids')
+        if not isinstance(references,list) or not 1<=len(references)<=20 or any(not isinstance(r,str) or r not in valid for r in references):
+            raise ValueError('报告引用未知或缺失证据，未接受该报告')
+    return response['summary'],cleaned,claims,'references_validated_content_requires_review'
 
 
 def run(job):
@@ -96,13 +111,8 @@ def run(job):
     try:
         active(jid)
         with connection() as c:
-            ids=job_source_ids(c,job)
-            sources=[dict(c.execute('SELECT * FROM data_sources WHERE id=?',(sid,)).fetchone()) for sid in ids]
-            metrics=[dict(row) for row in c.execute('''SELECT m.*,t.name AS term_name,
-                t.definition AS term_definition,t.unit AS term_unit FROM metrics m
-                LEFT JOIN metric_term_links l ON l.metric_id=m.id
-                LEFT JOIN metric_terms t ON t.id=l.term_id WHERE m.source_id IN ('''+
-                ','.join('?' for _ in ids)+') ORDER BY m.created',ids)]
+            job=dict(c.execute('SELECT * FROM analysis_jobs WHERE id=?',(jid,)).fetchone())
+            sources,metrics=load_catalog(c,job)
         if not metrics: raise ValueError('数据源尚未配置指标')
         if planning:
             analysis_event(jid,'正在根据指标目录生成分析方案')
@@ -112,12 +122,18 @@ def run(job):
             analysis_event(jid,'分析方案已生成，等待负责人审批')
             return
         update(jid,status='analyzing');analysis_event(jid,'开始执行经过批准的指标计算')
-        spec=json.loads(job['query_spec']);spec,rows=execute_multi(sources,metrics,spec)
-        active(jid);update(jid,status='reporting');analysis_event(jid,f'完成 {len(rows)} 个聚合结果，正在生成报告')
-        summary,recommendations=report(job,sources,metrics,spec,rows)
+        with connection() as c:
+            sources,metrics,spec,snapshot=check_approval_snapshot(c,job)
+        spec,rows,evidence=execute_with_evidence(sources,metrics,spec)
+        evidence['approval_configuration_hash']=snapshot['configuration_hash']
+        result={'report':'','query':spec,'rows':rows,'generated_at':time.time(),
+                'source':'、'.join(source['name'] for source in sources),'row_count':len(rows),
+                'evidence':evidence,'claims':[],'claim_validation':'model_pending'}
+        active(jid);update(jid,status='reporting',result=json.dumps(result,ensure_ascii=False))
+        analysis_event(jid,f'完成 {len(rows)} 个聚合结果，正在生成报告')
+        summary,recommendations,claims,claim_validation=report(job,sources,metrics,spec,rows,evidence)
         active(jid)
-        result={'report':summary,'query':spec,'rows':rows,'generated_at':time.time(),
-                'source':'、'.join(source['name'] for source in sources),'row_count':len(rows)}
+        result.update(report=summary,generated_at=time.time(),claims=claims,claim_validation=claim_validation)
         update(jid,status='review',result=json.dumps(result,ensure_ascii=False))
         with connection() as c:
             if c.execute("SELECT status FROM analysis_jobs WHERE id=?",(jid,)).fetchone()['status']=='review':

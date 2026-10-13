@@ -25,7 +25,16 @@ export async function api(path: string, body?: unknown) {
           body: JSON.stringify(body),
         }),
   });
-  const data = await r.json();
+  let data;
+  try {
+    data = await r.json();
+  } catch {
+    throw new Error(
+      r.ok
+        ? "服务返回的内容无法读取，请刷新后重试"
+        : `服务暂不可用（HTTP ${r.status}），请稍后重试`,
+    );
+  }
   if (!r.ok) {
     if (r.status === 401 && path !== "/auth/login")
       window.dispatchEvent(new Event("esi:logout"));

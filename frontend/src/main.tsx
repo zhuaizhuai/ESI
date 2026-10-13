@@ -28,6 +28,8 @@ import { TeamAdmin, ProjectMembers, AuditLog, roleNames } from "./team";
 import { AnalysisCenter, DataCenter, type DataSource } from "./intelligence";
 import { PlatformCenter } from "./platform";
 import { WorkflowStrip } from "./workflow";
+import { DevelopmentPlan, EvidencePanel, RetryTask } from "./capabilities";
+import { ActionInbox } from "./actions";
 
 type Project = {
   id: string;
@@ -65,7 +67,13 @@ type Task = {
   result?: {
     summary: string;
     diff: string;
-    checks: { project_id: string; project_name: string; command: string; exit_code: number; output: string }[];
+    checks: {
+      project_id: string;
+      project_name: string;
+      command: string;
+      exit_code: number;
+      output: string;
+    }[];
   };
 };
 type Config = {
@@ -117,7 +125,14 @@ function App({
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [plan, setPlan] = useState(""),
-    [impactHints, setImpactHints] = useState<{ project_id: string; project_name: string; system_name: string; relationship: string }[]>([]);
+    [impactHints, setImpactHints] = useState<
+      {
+        project_id: string;
+        project_name: string;
+        system_name: string;
+        relationship: string;
+      }[]
+    >([]);
   const refresh = async () => {
     const [p, d, t, c] = await Promise.all([
       api("/projects"),
@@ -222,6 +237,13 @@ function App({
         </div>
         <nav>
           <button
+            className={view === "actions" ? "active" : ""}
+            onClick={() => setView("actions")}
+          >
+            <Check size={18} />
+            我的行动
+          </button>
+          <button
             className={view === "analysis" ? "active" : ""}
             onClick={() => {
               setView("analysis");
@@ -240,7 +262,10 @@ function App({
           </button>
           <button
             className={view === "platform" ? "active" : ""}
-            onClick={() => { setView("platform"); refresh(); }}
+            onClick={() => {
+              setView("platform");
+              refresh();
+            }}
           >
             <Network size={18} />
             企业系统与知识
@@ -297,7 +322,7 @@ function App({
           <div className="avatar">{user.display_name.slice(0, 1)}</div>
           <div>
             {user.display_name}
-            <small>{roleNames[user.role]} · v0.4</small>
+            <small>{roleNames[user.role]} · v0.5</small>
           </div>
           <button className="logout" aria-label="退出登录" onClick={onLogout}>
             <LogOut size={16} />
@@ -312,21 +337,23 @@ function App({
           <span>工作空间</span>
           <ChevronRight size={14} />
           <b>
-            {view === "analysis"
-              ? "经营分析"
-              : view === "data"
-                ? "数据与指标"
-                : view === "platform"
-                  ? "企业系统与知识"
-                : view === "team"
-                  ? "团队与账号"
-                  : view === "audit"
-                    ? "操作审计"
-                    : view === "projects"
-                      ? "项目仓库"
-                      : view === "settings"
-                        ? "模型与设置"
-                        : "研发任务"}
+            {view === "actions"
+              ? "我的行动"
+              : view === "analysis"
+                ? "经营分析"
+                : view === "data"
+                  ? "数据与指标"
+                  : view === "platform"
+                    ? "企业系统与知识"
+                    : view === "team"
+                      ? "团队与账号"
+                      : view === "audit"
+                        ? "操作审计"
+                        : view === "projects"
+                          ? "项目仓库"
+                          : view === "settings"
+                            ? "模型与设置"
+                            : "研发任务"}
           </b>
           <div className="header-right">
             <span className={"dot " + (!config?.configured ? "off" : "")} />
@@ -342,11 +369,18 @@ function App({
               </button>
             </div>
           )}
+          {view === "actions" && <ActionInbox user={user} />}
           {view === "analysis" && (
             <AnalysisCenter user={user} sources={dataSources} config={config} />
           )}
           {view === "data" && <DataCenter user={user} />}
-          {view === "platform" && <PlatformCenter user={user} projects={projects} sources={dataSources} />}
+          {view === "platform" && (
+            <PlatformCenter
+              user={user}
+              projects={projects}
+              sources={dataSources}
+            />
+          )}
           {view === "team" && isAdmin && <TeamAdmin current={user} />}
           {view === "audit" && isAdmin && <AuditLog />}
           {view === "tasks" && (
@@ -573,7 +607,12 @@ function App({
                   <div className="eyebrow">TASK / {selected.id}</div>
                   <h1>{selected.title}</h1>
                   <p>
-                    {(selected.project_ids || [selected.project_id]).map((id) => projects.find((p) => p.id === id)?.name || id).join("、")} ·{" "}
+                    {(selected.project_ids || [selected.project_id])
+                      .map(
+                        (id) => projects.find((p) => p.id === id)?.name || id,
+                      )
+                      .join("、")}{" "}
+                    ·{" "}
                     <span className={"badge " + selected.status}>
                       {names[selected.status]}
                     </span>
@@ -588,7 +627,18 @@ function App({
                   </button>
                 )}
               </div>
-              <WorkflowStrip kind="development" jobId={selected.id} status={selected.status} />
+              <WorkflowStrip
+                kind="development"
+                jobId={selected.id}
+                status={selected.status}
+              />
+              <RetryTask
+                kind="development"
+                id={selected.id}
+                status={selected.status}
+                canEdit={selected.can_edit}
+                onChanged={() => openTask(selected.id)}
+              />
               {config?.execution && !config.execution.available && (
                 <p className="error">
                   {config.execution.message}
@@ -653,27 +703,6 @@ function App({
                           >
                             保存修改
                           </button>
-                          <button
-                            className="primary"
-                            disabled={
-                              busy ||
-                              !selected.can_review ||
-                              !config?.execution?.available ||
-                              plan !== selected.plan
-                            }
-                            onClick={() =>
-                              action(() =>
-                                mutate("approve", {
-                                  version: selected.version,
-                                }),
-                              )
-                            }
-                          >
-                            <Check size={17} />
-                            {selected.can_review
-                              ? "批准方案并执行"
-                              : "等待项目负责人批准"}
-                          </button>
                         </div>
                         {plan !== selected.plan && (
                           <p className="hint">请先保存修改，再批准新版本。</p>
@@ -689,6 +718,15 @@ function App({
                       </p>
                     )}
                   </section>
+                  <DevelopmentPlan
+                    id={selected.id}
+                    version={selected.version}
+                    status={selected.status}
+                    canEdit={selected.can_edit}
+                    projects={projects}
+                    outerDirty={plan !== selected.plan}
+                    onChanged={() => openTask(selected.id)}
+                  />
                 </>
               )}
               {tab === "logs" && (
@@ -719,6 +757,13 @@ function App({
                     </div>
                   )}
                 </section>
+              )}
+              {tab === "result" && (
+                <EvidencePanel
+                  kind="development"
+                  id={selected.id}
+                  status={selected.status}
+                />
               )}
               {tab === "result" && (
                 <>
@@ -756,7 +801,8 @@ function App({
                               >
                                 {c.exit_code === 0 ? "通过" : "失败"}
                               </span>{" "}
-                              {c.project_name ? c.project_name + " · " : ""}{c.command}
+                              {c.project_name ? c.project_name + " · " : ""}
+                              {c.command}
                             </summary>
                             <pre>{c.output || "命令无输出"}</pre>
                           </details>
@@ -864,8 +910,11 @@ function App({
                     setModal("");
                     setView("projects");
                   } else {
-                    const selectedProjects = f.getAll("project_ids").map(String);
-                    if (!selectedProjects.length) throw new Error("请至少选择一个目标项目");
+                    const selectedProjects = f
+                      .getAll("project_ids")
+                      .map(String);
+                    if (!selectedProjects.length)
+                      throw new Error("请至少选择一个目标项目");
                     const t = await api("/tasks", {
                       project_id: selectedProjects[0],
                       project_ids: selectedProjects,
@@ -915,27 +964,61 @@ function App({
                 </>
               ) : (
                 <>
-                  <fieldset className="source-picker" onChange={async (event) => {
-                    const ids = Array.from(event.currentTarget.querySelectorAll<HTMLInputElement>('input[name="project_ids"]:checked')).map((input) => input.value);
-                    if (!ids.length) { setImpactHints([]); return; }
-                    try {
-                      const suggestions = (await Promise.all(ids.map((id) => api(`/platform/impacts/${id}`)))).flat();
-                      setImpactHints(suggestions.filter((item, index, all) =>
-                        !ids.includes(item.project_id) && all.findIndex((other) => other.project_id === item.project_id) === index));
-                    } catch { setImpactHints([]); }
-                  }}>
+                  <fieldset
+                    className="source-picker"
+                    onChange={async (event) => {
+                      const ids = Array.from(
+                        event.currentTarget.querySelectorAll<HTMLInputElement>(
+                          'input[name="project_ids"]:checked',
+                        ),
+                      ).map((input) => input.value);
+                      if (!ids.length) {
+                        setImpactHints([]);
+                        return;
+                      }
+                      try {
+                        const suggestions = (
+                          await Promise.all(
+                            ids.map((id) => api(`/development/impacts/${id}`)),
+                          )
+                        ).flat();
+                        setImpactHints(
+                          suggestions.filter(
+                            (item, index, all) =>
+                              !ids.includes(item.project_id) &&
+                              all.findIndex(
+                                (other) => other.project_id === item.project_id,
+                              ) === index,
+                          ),
+                        );
+                      } catch {
+                        setImpactHints([]);
+                      }
+                    }}
+                  >
                     <legend>目标项目（可多选）</legend>
                     {writableProjects.map((p) => (
                       <label key={p.id}>
-                        <input type="checkbox" name="project_ids" value={p.id} />
+                        <input
+                          type="checkbox"
+                          name="project_ids"
+                          value={p.id}
+                        />
                         {p.name}
                       </label>
                     ))}
                   </fieldset>
-                  {impactHints.length > 0 && <p className="hint">
-                    目录中发现相关仓库，可按需一并选择：{impactHints.map((item) =>
-                      `${item.project_name}（${item.system_name}${item.relationship ? " · " + item.relationship : ""}）`).join("、")}
-                  </p>}
+                  {impactHints.length > 0 && (
+                    <p className="hint">
+                      目录中发现相关仓库，可按需一并选择：
+                      {impactHints
+                        .map(
+                          (item) =>
+                            `${item.project_name}（${item.system_name}${item.relationship ? " · " + item.relationship : ""}）`,
+                        )
+                        .join("、")}
+                    </p>
+                  )}
                   {!projects.length && (
                     <p className="hint">请先到“项目仓库”连接一个仓库。</p>
                   )}

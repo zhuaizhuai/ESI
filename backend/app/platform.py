@@ -353,49 +353,28 @@ def list_recommendations(job_id: str, user=Depends(current_user)):
         rows=c.execute('''SELECT r.*,u.display_name AS assignee_name
           FROM recommendations r LEFT JOIN users u ON u.id=r.assignee_id
           WHERE r.job_id=? ORDER BY r.created''', (job_id,))
-        return [dict(row) for row in rows if full or row['assignee_id']==user['id']]
+        from .actions import present_action
+        owner = False
+        try:
+            require_analysis_sources(c,user,job,'owner')
+            owner = True
+        except HTTPException:
+            pass
+        return [present_action(c,row,owner) for row in rows if full or row['assignee_id']==user['id']]
 
 
 @router.post('/recommendations/{rid}/assign')
 def assign_recommendation(rid: str, data: AssigneeInput, user=Depends(current_user)):
+    from .actions import ActionConfiguration, access_action, configure_action
+    import json
     with connection() as c:
-        c.execute('BEGIN IMMEDIATE')
-        rec = c.execute('SELECT * FROM recommendations WHERE id=?', (rid,)).fetchone()
-        if not rec:
-            raise HTTPException(404, '建议不存在')
-        job = analysis_job(c, user, rec['job_id'], 'owner')
-        target = c.execute('SELECT * FROM users WHERE id=? AND active=1',
-                           (data.assignee_id,)).fetchone()
-        if not target:
-            raise HTTPException(404, '员工不存在或已停用')
-        require_analysis_sources(c, dict(target), job)
-        c.execute('UPDATE recommendations SET assignee_id=?,updated=? WHERE id=?',
-                  (data.assignee_id, time.time(), rid))
-        audit(c, user['id'], 'recommendation_assigned', rid, data.assignee_id)
-    return {'ok': True}
+        rec, _, _ = access_action(c,user,rid,True)
+    config = {key:rec.get(key) for key in ('due_at','metric_id','baseline','target','direction','start_date','end_date')}
+    config['dimensions'] = json.loads(rec['dimensions'] or '{}')
+    return configure_action(rid,ActionConfiguration(assignee_id=data.assignee_id,**config),user)
 
 
 @router.post('/recommendations/{rid}/feedback')
 def feedback_recommendation(rid: str, data: FeedbackInput, user=Depends(current_user)):
-    with connection() as c:
-        c.execute('BEGIN IMMEDIATE')
-        rec = c.execute('SELECT * FROM recommendations WHERE id=?', (rid,)).fetchone()
-        if not rec:
-            raise HTTPException(404, '建议不存在')
-        job = analysis_job(c, user, rec['job_id'])
-        owner = False
-        try:
-            require_analysis_sources(c, user, job, 'owner')
-            owner = True
-        except HTTPException:
-            pass
-        if not owner and rec['assignee_id'] != user['id']:
-            raise HTTPException(403, '只有负责人或被分配员工可以反馈')
-        if rec['status'] in ('done', 'dismissed'):
-            raise HTTPException(409, '建议已经结束')
-        if data.status == 'done' and not data.outcome.strip():
-            raise HTTPException(400, '完成时请填写实际结果')
-        c.execute('UPDATE recommendations SET status=?,outcome=?,updated=? WHERE id=?',
-                  (data.status, data.outcome, time.time(), rid))
-        audit(c, user['id'], 'recommendation_feedback', rid, data.status)
-    return {'ok': True}
+    from .actions import ActionFeedback, feedback_action
+    return feedback_action(rid,ActionFeedback(**data.model_dump()),user)

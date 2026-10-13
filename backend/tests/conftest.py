@@ -13,11 +13,11 @@ import time
 @pytest.fixture(autouse=True)
 def clean_database():
     with connection() as c:
-        for table in ('sessions','login_attempts','recommendations','workflow_steps',
+        for table in ('approved_plans','resource_acceptances','action_events','notifications','resource_approvals','runtime_attempts','development_runs','sessions','login_attempts','recommendations','workflow_steps',
                       'analysis_job_sources','metric_term_links','metric_terms','knowledge_entries',
                       'system_dependencies','system_resources','enterprise_systems',
                       'data_source_members','analysis_events','analysis_jobs','metrics','data_sources',
-                      'project_members','events','audit','tasks','projects','users'):
+                      'task_project_runs','task_projects','project_members','events','audit','tasks','projects','users'):
             c.execute('DELETE FROM '+table)
         c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?,?)',
                   ('test-admin','admin','Test Admin',password_hash('Admin-test-password-123'),'admin',1,0,time.time()))

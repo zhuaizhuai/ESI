@@ -1180,7 +1180,9 @@ textarea {
   color: #263244;
   background: #fff;
 }
-.platform-form label:has(textarea) { flex-basis: 100%; }
+.platform-form label:has(textarea) {
+  flex-basis: 100%;
+}
 .platform-search {
   display: flex;
   align-items: center;
@@ -1206,8 +1208,14 @@ textarea {
   background: #f4f6f9;
   color: #667085;
 }
-.platform-steps li.active { background: #e8efff; color: #2647a9; }
-.platform-steps li.done { background: #eaf7f0; color: #20724a; }
+.platform-steps li.active {
+  background: #e8efff;
+  color: #2647a9;
+}
+.platform-steps li.done {
+  background: #eaf7f0;
+  color: #20724a;
+}
 .platform-steps li > span {
   display: grid;
   place-items: center;
@@ -1217,7 +1225,10 @@ textarea {
   background: #fff;
   font-size: 11px;
 }
-.platform-steps small { font-size: 11px; opacity: .8; }
+.platform-steps small {
+  font-size: 11px;
+  opacity: 0.8;
+}
 .source-picker {
   display: grid;
   gap: 8px;
@@ -1226,9 +1237,18 @@ textarea {
   margin: 0 0 14px;
   padding: 12px;
 }
-.source-picker label { display: flex; align-items: center; gap: 8px; }
-.source-picker input { width: auto; }
-.recommendation { border-top: 1px solid #e5e8ee; padding: 16px 0; }
+.source-picker label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.source-picker input {
+  width: auto;
+}
+.recommendation {
+  border-top: 1px solid #e5e8ee;
+  padding: 16px 0;
+}
 @media (max-width: 900px) {
   .auth-shell {
     gap: 40px;
@@ -1280,4 +1300,130 @@ textarea {
   .team-table td {
     min-width: 90px;
   }
+}
+/* Workflow detail and employee actions reuse the workbench's existing scale. */
+.capability-fields {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.capability-fields:disabled {
+  opacity: 1;
+}
+.capability-fields:disabled input,
+.capability-fields:disabled textarea,
+.capability-fields:disabled select {
+  color: #344054;
+  background: #f8fafc;
+  opacity: 1;
+}
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 18px;
+}
+.project-plan {
+  border-top: 1px solid #e5e8ee;
+  margin-top: 18px;
+  padding-top: 12px;
+}
+.approval-list {
+  margin-top: 12px;
+}
+.approval-row {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  border-top: 1px solid #e5e8ee;
+  padding: 12px 0;
+}
+.approval-row > div {
+  flex: 1;
+  min-width: 180px;
+  overflow-wrap: anywhere;
+}
+.approval-row small {
+  display: block;
+  margin-top: 4px;
+  color: #667085;
+}
+.warning-note {
+  padding: 10px 12px;
+  background: #fff7e8;
+  color: #854d0e;
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+.action-form {
+  margin: 14px 0;
+  padding-top: 12px;
+  border-top: 1px solid #edf0f5;
+}
+.action-form button + button {
+  margin-left: 8px;
+}
+.panel details {
+  margin: 12px 0;
+}
+.panel summary {
+  cursor: pointer;
+  color: #344054;
+  font-weight: 500;
+  padding: 5px 0;
+}
+.evidence-details {
+  margin: 8px 0;
+  display: block;
+}
+.evidence-details > div {
+  display: grid;
+  grid-template-columns: minmax(100px, 160px) minmax(0, 1fr);
+  gap: 12px;
+  border-top: 1px solid #edf0f5;
+  padding: 8px 0;
+}
+.evidence-details dt {
+  color: #667085;
+  overflow-wrap: anywhere;
+}
+.evidence-details dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.evidence-values {
+  padding-left: 20px;
+}
+.evidence-values > li {
+  margin-bottom: 10px;
+}
+.inline-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+.inline-label select {
+  width: auto;
+  margin: 0;
+}
+@media (max-width: 650px) {
+  .field-grid {
+    grid-template-columns: 1fr;
+  }
+  .evidence-details > div {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.checkbox-label input {
+  width: auto;
+  margin: 0;
 }

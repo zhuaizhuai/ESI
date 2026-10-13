@@ -1,0 +1,12 @@
+# 研发接口；将实际session和csrf替换为测试登录响应。
+# 本地实际验证采用test_development.py TestClient请求，无企业账号。
+GET http://localhost:8000/api/development/tasks/{{task_id}}/plan
+Cookie: esi_session={{session}}
+
+### 交付
+GET http://localhost:8000/api/development/tasks/{{task_id}}/delivery
+Cookie: esi_session={{session}}
+
+### 影响
+GET http://localhost:8000/api/development/impacts/{{project_id}}
+Cookie: esi_session={{session}}
